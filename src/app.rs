@@ -21,6 +21,8 @@ const RADIAL_OVERLAY_SIZE: f32 = RADIAL_OVERLAY_MARGIN * 2.0;
 
 #[derive(Clone)]
 struct RadialMenuEntry {
+    profile_idx: usize,
+    section: ActionSection,
     action_idx: usize,
     action: Action,
 }
@@ -29,6 +31,36 @@ struct RadialMenuEntry {
 enum RadialMenuSource {
     LocalPointer,
     GlobalTrigger,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActionSection {
+    GlobalTools,
+    ActiveWindowTools,
+}
+
+impl ActionSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GlobalTools => "Global Tools",
+            Self::ActiveWindowTools => "Current Window Tools",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ActionScope {
+    profile_idx: usize,
+    section: ActionSection,
+    path: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct ActionListEntry {
+    profile_idx: usize,
+    section: ActionSection,
+    action_idx: usize,
+    action: Action,
 }
 
 struct RadialMenuState {
@@ -67,7 +99,7 @@ pub struct QuickerApp {
     focus_tracker: FocusTracker,
     last_focus_poll: Instant,
     needs_focus_profile_sync: bool,
-    group_path: Vec<usize>,
+    action_scope: Option<ActionScope>,
     view: View,
     toast: Option<Toast>,
     script_output: String,
@@ -115,7 +147,7 @@ impl QuickerApp {
             focus_tracker: FocusTracker::new(std::process::id()),
             last_focus_poll: Instant::now() - FOCUS_POLL_INTERVAL,
             needs_focus_profile_sync: true,
-            group_path: Vec::new(),
+            action_scope: None,
             view: View::Panel,
             toast: None,
             script_output: String::new(),
@@ -160,9 +192,15 @@ impl QuickerApp {
         }
     }
 
-    fn trigger_action_from_idx(&mut self, action_idx: usize, action: Action) {
+    fn trigger_action(
+        &mut self,
+        profile_idx: usize,
+        section: ActionSection,
+        action_idx: usize,
+        action: Action,
+    ) {
         match action.kind {
-            ActionKind::Group { .. } => self.open_group(action_idx),
+            ActionKind::Group { .. } => self.open_group(profile_idx, section, action_idx),
             _ => self.execute_action(&action),
         }
     }
@@ -170,8 +208,15 @@ impl QuickerApp {
     fn set_active_profile(&mut self, profile_idx: usize) {
         if self.active_profile != profile_idx {
             self.active_profile = profile_idx;
-            self.group_path.clear();
             self.query.clear();
+            if matches!(
+                self.action_scope.as_ref(),
+                Some(scope)
+                    if scope.section == ActionSection::ActiveWindowTools
+                        && scope.profile_idx != profile_idx
+            ) {
+                self.action_scope = None;
+            }
         }
     }
 
@@ -206,10 +251,18 @@ impl QuickerApp {
         self.edit_field3.clear();
     }
 
-    fn current_profile_actions(&self) -> &[Action] {
+    fn global_profile_idx(&self) -> usize {
+        0
+    }
+
+    fn active_window_profile_index(&self) -> Option<usize> {
+        (self.active_profile != self.global_profile_idx()).then_some(self.active_profile)
+    }
+
+    fn profile_actions(&self, profile_idx: usize) -> &[Action] {
         self.config
             .profiles
-            .get(self.active_profile)
+            .get(profile_idx)
             .map(|p| p.actions.as_slice())
             .unwrap_or(&[])
     }
@@ -241,21 +294,79 @@ impl QuickerApp {
         }
     }
 
-    fn current_actions(&self) -> &[Action] {
-        Self::actions_at_path(self.current_profile_actions(), &self.group_path)
-            .unwrap_or_else(|| self.current_profile_actions())
+    fn actions_for_scope<'a>(&'a self, scope: &'a ActionScope) -> &'a [Action] {
+        Self::actions_at_path(self.profile_actions(scope.profile_idx), &scope.path)
+            .unwrap_or_else(|| self.profile_actions(scope.profile_idx))
+    }
+
+    fn action_entries(
+        &self,
+        profile_idx: usize,
+        section: ActionSection,
+        actions: &[Action],
+    ) -> Vec<ActionListEntry> {
+        actions
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(action_idx, action)| ActionListEntry {
+                profile_idx,
+                section,
+                action_idx,
+                action,
+            })
+            .collect()
+    }
+
+    fn current_action_entries(&self) -> Vec<ActionListEntry> {
+        if let Some(scope) = &self.action_scope {
+            return self.action_entries(
+                scope.profile_idx,
+                scope.section,
+                self.actions_for_scope(scope),
+            );
+        }
+
+        let mut entries = self.action_entries(
+            self.global_profile_idx(),
+            ActionSection::GlobalTools,
+            self.profile_actions(self.global_profile_idx()),
+        );
+
+        if let Some(profile_idx) = self.active_window_profile_index() {
+            entries.extend(self.action_entries(
+                profile_idx,
+                ActionSection::ActiveWindowTools,
+                self.profile_actions(profile_idx),
+            ));
+        }
+
+        entries
     }
 
     fn current_actions_mut(&mut self) -> Option<&mut Vec<Action>> {
-        let path = self.group_path.clone();
-        let profile = self.config.profiles.get_mut(self.active_profile)?;
+        let (profile_idx, path) = if let Some(scope) = &self.action_scope {
+            (scope.profile_idx, scope.path.clone())
+        } else {
+            (
+                self.active_window_profile_index()
+                    .unwrap_or(self.global_profile_idx()),
+                Vec::new(),
+            )
+        };
+
+        let profile = self.config.profiles.get_mut(profile_idx)?;
         Self::actions_at_path_mut(&mut profile.actions, &path)
     }
 
     fn group_titles(&self) -> Vec<String> {
+        let Some(scope) = &self.action_scope else {
+            return Vec::new();
+        };
+
         let mut titles = Vec::new();
-        let mut current = self.current_profile_actions();
-        for &idx in &self.group_path {
+        let mut current = self.profile_actions(scope.profile_idx);
+        for &idx in &scope.path {
             let Some(action) = current.get(idx) else {
                 break;
             };
@@ -268,35 +379,49 @@ impl QuickerApp {
         titles
     }
 
-    fn open_group(&mut self, action_idx: usize) {
-        self.group_path.push(action_idx);
+    fn open_group(&mut self, profile_idx: usize, section: ActionSection, action_idx: usize) {
+        match &mut self.action_scope {
+            Some(scope) if scope.profile_idx == profile_idx && scope.section == section => {
+                scope.path.push(action_idx);
+            }
+            _ => {
+                self.action_scope = Some(ActionScope {
+                    profile_idx,
+                    section,
+                    path: vec![action_idx],
+                });
+            }
+        }
         self.query.clear();
     }
 
     fn leave_group(&mut self) {
-        self.group_path.pop();
+        let Some(scope) = &mut self.action_scope else {
+            return;
+        };
+
+        scope.path.pop();
+        if scope.path.is_empty() {
+            self.action_scope = None;
+        }
         self.query.clear();
     }
 
     fn radial_entries(&self) -> Vec<RadialMenuEntry> {
-        let actions = self.current_actions().to_vec();
-        let results = self.search.search(&self.query, &actions);
+        let entries = self.current_action_entries();
+        let results = self.filtered_entries(&entries);
 
-        if results.is_empty() {
-            actions
-                .into_iter()
-                .enumerate()
-                .map(|(action_idx, action)| RadialMenuEntry { action_idx, action })
-                .collect()
-        } else {
-            results
-                .into_iter()
-                .map(|(_, action_idx, action)| RadialMenuEntry {
-                    action_idx,
-                    action: action.clone(),
-                })
-                .collect()
-        }
+        let visible_entries = if results.is_empty() { entries } else { results };
+
+        visible_entries
+            .into_iter()
+            .map(|entry| RadialMenuEntry {
+                profile_idx: entry.profile_idx,
+                section: entry.section,
+                action_idx: entry.action_idx,
+                action: entry.action,
+            })
+            .collect()
     }
 
     fn start_local_radial_menu(&mut self, ctx: &egui::Context, pointer: egui::Pos2) {
@@ -403,7 +528,12 @@ impl QuickerApp {
             radial_ring_counts(menu.entries.len()),
         ) {
             let entry = menu.entries[entry_idx].clone();
-            self.trigger_action_from_idx(entry.action_idx, entry.action);
+            self.trigger_action(
+                entry.profile_idx,
+                entry.section,
+                entry.action_idx,
+                entry.action,
+            );
         }
 
         if menu.source == RadialMenuSource::GlobalTrigger {
@@ -460,16 +590,161 @@ impl QuickerApp {
         self.radial_menu.as_ref().map(|menu| menu.source)
     }
 
-    fn render_panel(&mut self, ui: &mut egui::Ui) {
-        // --- Profile tabs ---
-        let mut clicked_profile = None;
-        ui.horizontal(|ui| {
-            for (i, profile) in self.config.profiles.iter().enumerate() {
-                let selected = i == self.active_profile;
-                if ui.selectable_label(selected, &profile.name).clicked() {
-                    clicked_profile = Some(i);
+    fn filtered_entries(&self, entries: &[ActionListEntry]) -> Vec<ActionListEntry> {
+        let actions: Vec<Action> = entries.iter().map(|entry| entry.action.clone()).collect();
+        self.search
+            .search(&self.query, &actions)
+            .into_iter()
+            .map(|(_, idx, _)| entries[idx].clone())
+            .collect()
+    }
+
+    fn add_action_target_profile_idx(&self) -> usize {
+        self.action_scope
+            .as_ref()
+            .map(|scope| scope.profile_idx)
+            .or_else(|| self.active_window_profile_index())
+            .unwrap_or(self.global_profile_idx())
+    }
+
+    fn add_action_target_label(&self) -> String {
+        let profile_name = self
+            .config
+            .profiles
+            .get(self.add_action_target_profile_idx())
+            .map(|profile| profile.name.as_str())
+            .unwrap_or("Default");
+
+        if let Some(scope) = &self.action_scope {
+            format!("{} / {}", scope.section.label(), profile_name)
+        } else if self.active_window_profile_index().is_some() {
+            format!(
+                "{} / {}",
+                ActionSection::ActiveWindowTools.label(),
+                profile_name
+            )
+        } else {
+            format!("{} / {}", ActionSection::GlobalTools.label(), profile_name)
+        }
+    }
+
+    fn render_action_results_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        grid_id: &str,
+        entries: &[ActionListEntry],
+    ) {
+        let cols = self.config.columns;
+        let mut clicked_action: Option<ActionListEntry> = None;
+
+        egui::Grid::new(grid_id)
+            .num_columns(cols)
+            .spacing([8.0, 8.0])
+            .min_col_width(ui.available_width() / cols as f32 - 8.0)
+            .show(ui, |ui| {
+                for (i, entry) in entries.iter().enumerate() {
+                    if i > 0 && i % cols == 0 {
+                        ui.end_row();
+                    }
+                    let btn_width = ui
+                        .available_width()
+                        .min((self.config.panel_width - 32.0) / cols as f32 - 8.0);
+
+                    let icon = entry
+                        .action
+                        .icon
+                        .as_deref()
+                        .unwrap_or(default_action_icon(&entry.action));
+                    let label = match &entry.action.kind {
+                        ActionKind::Group { .. } => format!("{} {} ›", icon, entry.action.name),
+                        _ => format!("{} {}", icon, entry.action.name),
+                    };
+
+                    let btn = egui::Button::new(egui::RichText::new(&label).size(14.0))
+                        .min_size(egui::vec2(btn_width, 48.0));
+
+                    let response = ui.add(btn);
+
+                    if !entry.action.description.is_empty() {
+                        response.clone().on_hover_text(&entry.action.description);
+                    }
+
+                    if response.clicked() {
+                        clicked_action = Some(entry.clone());
+                    }
                 }
+            });
+
+        if let Some(entry) = clicked_action {
+            self.trigger_action(
+                entry.profile_idx,
+                entry.section,
+                entry.action_idx,
+                entry.action,
+            );
+        }
+    }
+
+    fn render_action_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: &str,
+        subtitle: &str,
+        empty_message: &str,
+        section_id: &str,
+        entries: &[ActionListEntry],
+        height: f32,
+    ) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_height(height);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(title).strong());
+                if !subtitle.is_empty() {
+                    ui.label(egui::RichText::new(subtitle).weak().small());
+                }
+            });
+            ui.add_space(6.0);
+
+            if entries.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(24.0);
+                    ui.label(egui::RichText::new(empty_message).weak());
+                });
+                return;
             }
+
+            egui::ScrollArea::vertical()
+                .max_height((height - 32.0).max(80.0))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.render_action_results_grid(ui, section_id, entries)
+                });
+        });
+    }
+
+    fn render_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let focused_app = self
+                .focus_tracker
+                .current_external()
+                .map(|process| process.display_name())
+                .unwrap_or_else(|| "Unavailable".into());
+            let active_profile_name = self
+                .active_window_profile_index()
+                .and_then(|idx| self.config.profiles.get(idx))
+                .map(|profile| profile.name.clone())
+                .unwrap_or_else(|| "None".into());
+
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("Upper: Global tools").strong());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Lower: tools for focused app ({focused_app}) -> {active_profile_name}"
+                    ))
+                    .weak()
+                    .small(),
+                );
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("⚙").on_hover_text("Settings").clicked() {
                     self.view = View::Settings;
@@ -480,19 +755,19 @@ impl QuickerApp {
                 }
             });
         });
-        if let Some(profile_idx) = clicked_profile {
-            self.set_active_profile(profile_idx);
-            self.needs_focus_profile_sync = false;
-        }
 
         ui.separator();
 
-        if !self.group_path.is_empty() {
+        if let Some(scope) = self.action_scope.clone() {
             ui.horizontal_wrapped(|ui| {
                 if ui.button("← Back").clicked() {
                     self.leave_group();
                 }
-                ui.label(egui::RichText::new("Root").weak());
+                ui.label(egui::RichText::new(scope.section.label()).weak());
+                if let Some(profile) = self.config.profiles.get(scope.profile_idx) {
+                    ui.label(egui::RichText::new("›").weak());
+                    ui.label(egui::RichText::new(&profile.name).weak());
+                }
                 for title in self.group_titles() {
                     ui.label(egui::RichText::new("›").weak());
                     ui.label(title);
@@ -512,14 +787,80 @@ impl QuickerApp {
             search_response.request_focus();
         }
 
-        ui.add_space(4.0);
+        ui.add_space(6.0);
 
-        // --- Action grid ---
-        let actions = self.current_actions().to_vec();
-        let results = self.search.search(&self.query, &actions);
-        let cols = self.config.columns;
+        if self.action_scope.is_some() {
+            let entries = self.filtered_entries(&self.current_action_entries());
+            if entries.len() == 1 && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let entry = entries[0].clone();
+                self.trigger_action(
+                    entry.profile_idx,
+                    entry.section,
+                    entry.action_idx,
+                    entry.action,
+                );
+                return;
+            }
 
-        if results.is_empty() {
+            if entries.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.label(egui::RichText::new("No actions found").size(16.0).weak());
+                    ui.add_space(8.0);
+                    ui.label("Add some actions or adjust your search.");
+                });
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.render_action_results_grid(ui, "action_grid", &entries)
+                });
+            return;
+        }
+
+        let global_profile_idx = self.global_profile_idx();
+        let global_profile_name = self
+            .config
+            .profiles
+            .get(global_profile_idx)
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| "Default".into());
+        let global_entries = self.filtered_entries(&self.action_entries(
+            global_profile_idx,
+            ActionSection::GlobalTools,
+            self.profile_actions(global_profile_idx),
+        ));
+
+        let active_window_entries = self
+            .active_window_profile_index()
+            .map(|profile_idx| {
+                self.filtered_entries(&self.action_entries(
+                    profile_idx,
+                    ActionSection::ActiveWindowTools,
+                    self.profile_actions(profile_idx),
+                ))
+            })
+            .unwrap_or_default();
+
+        let total_results = global_entries.len() + active_window_entries.len();
+        if total_results == 1 && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let entry = global_entries
+                .first()
+                .cloned()
+                .or_else(|| active_window_entries.first().cloned())
+                .unwrap();
+            self.trigger_action(
+                entry.profile_idx,
+                entry.section,
+                entry.action_idx,
+                entry.action,
+            );
+            return;
+        }
+
+        if total_results == 0 {
             ui.vertical_centered(|ui| {
                 ui.add_space(40.0);
                 ui.label(egui::RichText::new("No actions found").size(16.0).weak());
@@ -529,56 +870,41 @@ impl QuickerApp {
             return;
         }
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let mut clicked_action: Option<(usize, Action)> = None;
-                egui::Grid::new("action_grid")
-                    .num_columns(cols)
-                    .spacing([8.0, 8.0])
-                    .min_col_width(ui.available_width() / cols as f32 - 8.0)
-                    .show(ui, |ui| {
-                        for (i, (_score, action_idx, action)) in results.iter().enumerate() {
-                            if i > 0 && i % cols == 0 {
-                                ui.end_row();
-                            }
-                            let btn_width = ui
-                                .available_width()
-                                .min((self.config.panel_width - 32.0) / cols as f32 - 8.0);
+        let available_height = ui.available_height();
+        let section_height = ((available_height - 12.0) * 0.5).max(140.0);
 
-                            let icon = action
-                                .icon
-                                .as_deref()
-                                .unwrap_or(default_action_icon(action));
-                            let label = match &action.kind {
-                                ActionKind::Group { .. } => format!("{} {} ›", icon, action.name),
-                                _ => format!("{} {}", icon, action.name),
-                            };
+        self.render_action_section(
+            ui,
+            ActionSection::GlobalTools.label(),
+            &global_profile_name,
+            "No global tools configured.",
+            "global_tools_grid",
+            &global_entries,
+            section_height,
+        );
 
-                            let btn = egui::Button::new(egui::RichText::new(&label).size(14.0))
-                                .min_size(egui::vec2(btn_width, 48.0));
+        ui.add_space(8.0);
 
-                            let response = ui.add(btn);
+        let current_window_subtitle = self
+            .active_window_profile_index()
+            .and_then(|idx| self.config.profiles.get(idx))
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| "No matching app-specific profile".into());
+        let current_window_empty = self
+            .focus_tracker
+            .current_external()
+            .map(|process| format!("No app-specific tools for {}", process.display_name()))
+            .unwrap_or_else(|| "Focus another app to load its tools here.".into());
 
-                            if !action.description.is_empty() {
-                                response.clone().on_hover_text(&action.description);
-                            }
-
-                            if response.clicked() {
-                                clicked_action = Some((*action_idx, (*action).clone()));
-                            }
-                        }
-                        // If only one result and Enter pressed, run it
-                        if results.len() == 1 && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            clicked_action = Some((results[0].1, results[0].2.clone()));
-                        }
-                    });
-
-                // Execute outside the borrow
-                if let Some((action_idx, action)) = clicked_action {
-                    self.trigger_action_from_idx(action_idx, action);
-                }
-            });
+        self.render_action_section(
+            ui,
+            ActionSection::ActiveWindowTools.label(),
+            &current_window_subtitle,
+            &current_window_empty,
+            "current_window_tools_grid",
+            &active_window_entries,
+            section_height,
+        );
     }
 
     fn render_settings(&mut self, ui: &mut egui::Ui) {
@@ -628,7 +954,7 @@ impl QuickerApp {
             ui.label(format!("Current focused process: {}", current_process_label));
             ui.label(
                 egui::RichText::new(
-                    "Profiles with match rules auto-activate. The first profile is the fallback when nothing matches.",
+                    "The first profile is fixed as the upper Global Tools section. Profiles with match rules are shown in the lower Current Window Tools section when their app is focused.",
                 )
                 .weak()
                 .small(),
@@ -641,40 +967,61 @@ impl QuickerApp {
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut profile.name);
                     ui.label(format!("({} actions)", profile.actions.len()));
-                    if let Some(alias) = current_process_alias.as_deref() {
-                        if ui.small_button(format!("Use {}", alias)).clicked()
-                            && !profile
-                                .match_processes
-                                .iter()
-                                .any(|value| value.eq_ignore_ascii_case(alias))
-                        {
-                            profile.match_processes.push(alias.into());
-                            profile_rules_changed = true;
+                    if i > 0 {
+                        if let Some(alias) = current_process_alias.as_deref() {
+                            if ui.small_button(format!("Use {}", alias)).clicked()
+                                && !profile
+                                    .match_processes
+                                    .iter()
+                                    .any(|value| value.eq_ignore_ascii_case(alias))
+                            {
+                                profile.match_processes.push(alias.into());
+                                profile_rules_changed = true;
+                            }
                         }
                     }
-                    if can_delete_profiles {
+                    if can_delete_profiles && i > 0 {
                         if ui.small_button("🗑").clicked() {
                             to_delete = Some(i);
                         }
                     }
                 });
-                let mut process_matches = profile.match_processes.join(", ");
-                ui.label("Match focused processes (comma-separated):");
-                if ui.text_edit_singleline(&mut process_matches).changed() {
-                    profile.match_processes = process_matches
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                    profile_rules_changed = true;
+                if i == 0 {
+                    ui.label(
+                        egui::RichText::new(
+                            "This profile is always shown in the top half and does not use match rules.",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                } else {
+                    let mut process_matches = profile.match_processes.join(", ");
+                    ui.label("Match focused processes (comma-separated):");
+                    if ui.text_edit_singleline(&mut process_matches).changed() {
+                        profile.match_processes = process_matches
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string)
+                            .collect();
+                        profile_rules_changed = true;
+                    }
                 }
                 ui.add_space(8.0);
             }
             if let Some(idx) = to_delete {
                 self.config.profiles.remove(idx);
+                if let Some(scope) = &mut self.action_scope {
+                    if scope.profile_idx == idx {
+                        self.action_scope = None;
+                    } else if scope.profile_idx > idx {
+                        scope.profile_idx -= 1;
+                    }
+                }
                 if self.active_profile >= self.config.profiles.len() {
                     self.active_profile = 0;
+                } else if self.active_profile > idx {
+                    self.active_profile -= 1;
                 }
                 self.needs_focus_profile_sync = true;
             }
@@ -722,6 +1069,13 @@ impl QuickerApp {
         ui.separator();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("Adding into: {}", self.add_action_target_label()))
+                    .weak()
+                    .small(),
+            );
+            ui.add_space(8.0);
+
             ui.label("Name:");
             ui.text_edit_singleline(&mut self.edit_name);
 
@@ -1086,7 +1440,7 @@ impl eframe::App for QuickerApp {
             } else if self.view != View::Panel {
                 self.view = View::Panel;
                 self.needs_focus_profile_sync = true;
-            } else if !self.group_path.is_empty() {
+            } else if self.action_scope.is_some() {
                 self.leave_group();
             }
         }

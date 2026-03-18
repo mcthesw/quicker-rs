@@ -290,6 +290,10 @@ fn read_primary_clipboard_text(clipboard: &mut arboard::Clipboard) -> Option<Str
     )
 }
 
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
 fn normalize_clipboard_text(text: Option<String>) -> Option<String> {
     let trimmed = text?.trim().to_string();
     if trimmed.is_empty() {

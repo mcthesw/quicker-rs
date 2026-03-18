@@ -41,7 +41,7 @@ fuzzy-matcher = "0.3"
 which = "7"
 
 # Clipboard
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 # URL encoding for search actions
 urlencoding = "2"

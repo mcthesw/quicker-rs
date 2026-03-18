@@ -46,11 +46,11 @@ impl QuickerApp {
         let mut style = (*cc.egui_ctx.style()).clone();
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 6.0);
-        style.visuals.window_rounding = egui::Rounding::same(8.0);
-        style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
-        style.visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
-        style.visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
-        style.visuals.widgets.active.rounding = egui::Rounding::same(6.0);
+        style.visuals.window_corner_radius = egui::CornerRadius::same(8);
+        style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+        style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
         cc.egui_ctx.set_style(style);
 
         Self {
@@ -483,10 +483,10 @@ impl QuickerApp {
                     } else {
                         egui::Color32::from_rgb(50, 160, 80)
                     };
-                    egui::Frame::none()
+                    egui::Frame::new()
                         .fill(color)
-                        .rounding(egui::Rounding::same(6.0))
-                        .inner_margin(egui::Margin::symmetric(16.0, 8.0))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(16, 8))
                         .show(ui, |ui| {
                             ui.label(
                                 egui::RichText::new(&toast.message)

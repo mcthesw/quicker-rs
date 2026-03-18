@@ -2641,6 +2641,7 @@ version = "0.1.0"
 dependencies = [
  "active-win-pos-rs",
  "arboard",
+ "dbus",
  "dirs",
  "eframe",
  "egui",

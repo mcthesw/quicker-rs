@@ -1,4 +1,8 @@
 use crate::focus::{self, FocusedProcess};
+#[cfg(target_os = "linux")]
+use dbus::blocking::Connection;
+#[cfg(target_os = "linux")]
+use dbus::message::MatchRule;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,6 +35,19 @@ pub enum GlobalMouseEvent {
 
 pub struct GlobalMouseHook {
     receiver: Receiver<GlobalMouseEvent>,
+}
+
+#[cfg(target_os = "linux")]
+const KDE_BRIDGE_BUS_NAME: &str = "net.quicker_rs.KWinBridge";
+#[cfg(target_os = "linux")]
+const KDE_BRIDGE_INTERFACE: &str = "net.quicker_rs.KWinBridge";
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinuxSessionKind {
+    X11,
+    Wayland,
+    Unknown,
 }
 
 impl GlobalMouseHook {
@@ -83,13 +100,26 @@ pub fn trigger_button_for_process(process: Option<&FocusedProcess>) -> TriggerBu
 
 #[cfg(target_os = "linux")]
 fn run_linux_hook(tx: mpsc::Sender<GlobalMouseEvent>) -> Result<(), String> {
-    if std::env::var("WAYLAND_DISPLAY").is_ok() && std::env::var("DISPLAY").is_err() {
-        return Err(
-            "Wayland session detected: global mouse grab is not available without X11/XWayland"
-                .into(),
-        );
-    }
+    match detect_linux_session_kind() {
+        LinuxSessionKind::X11 => return run_linux_x11_hook(tx),
+        LinuxSessionKind::Wayland => {
+            if is_kde_desktop() {
+                return run_kde_wayland_hook(tx);
+            }
 
+            let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unknown".into());
+            return Err(format!(
+                "Wayland session detected ({desktop}). Generic global right/middle-button capture is not supported on Wayland; this feature currently only has a KDE/KWin-specific backend"
+            ));
+        }
+        LinuxSessionKind::Unknown => {
+            return Err("Unable to determine Linux desktop session type".into());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_x11_hook(tx: mpsc::Sender<GlobalMouseEvent>) -> Result<(), String> {
     let (conn, _) = xcb::Connection::connect(None).map_err(|err| err.to_string())?;
     let setup = conn.get_setup();
     let root = setup
@@ -153,6 +183,92 @@ fn run_linux_hook(tx: mpsc::Sender<GlobalMouseEvent>) -> Result<(), String> {
 }
 
 #[cfg(target_os = "linux")]
+fn run_kde_wayland_hook(tx: mpsc::Sender<GlobalMouseEvent>) -> Result<(), String> {
+    let conn = Connection::new_session().map_err(|err| err.to_string())?;
+    conn.request_name(KDE_BRIDGE_BUS_NAME, false, true, false)
+        .map_err(|err| err.to_string())?;
+
+    let tx_start = tx.clone();
+    conn.add_match(
+        MatchRule::new_signal(KDE_BRIDGE_INTERFACE, "GestureStart"),
+        move |(x, y, button, window_class): (f64, f64, String, String), _, _| {
+            let button = match button.as_str() {
+                "right" => TriggerButton::Right,
+                _ => TriggerButton::Middle,
+            };
+            let process = if window_class.trim().is_empty() {
+                None
+            } else {
+                Some(FocusedProcess {
+                    app_name: window_class.clone(),
+                    process_id: 0,
+                    process_path: window_class,
+                })
+            };
+            let _ = tx_start.send(GlobalMouseEvent::GestureStart {
+                screen_pos: (x as f32, y as f32),
+                button,
+                process,
+            });
+            true
+        },
+    )
+    .map_err(|err| err.to_string())?;
+
+    let tx_move = tx.clone();
+    conn.add_match(
+        MatchRule::new_signal(KDE_BRIDGE_INTERFACE, "GestureMove"),
+        move |(x, y): (f64, f64), _, _| {
+            let _ = tx_move.send(GlobalMouseEvent::GestureMove {
+                screen_pos: (x as f32, y as f32),
+            });
+            true
+        },
+    )
+    .map_err(|err| err.to_string())?;
+
+    conn.add_match(
+        MatchRule::new_signal(KDE_BRIDGE_INTERFACE, "GestureEnd"),
+        move |(x, y): (f64, f64), _, _| {
+            let _ = tx.send(GlobalMouseEvent::GestureEnd {
+                screen_pos: (x as f32, y as f32),
+            });
+            true
+        },
+    )
+    .map_err(|err| err.to_string())?;
+
+    loop {
+        conn.process(Duration::from_millis(250))
+            .map_err(|err| err.to_string())?;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_linux_session_kind() -> LinuxSessionKind {
+    match std::env::var("XDG_SESSION_TYPE") {
+        Ok(value) if value.eq_ignore_ascii_case("x11") => LinuxSessionKind::X11,
+        Ok(value) if value.eq_ignore_ascii_case("wayland") => LinuxSessionKind::Wayland,
+        _ => {
+            if std::env::var("WAYLAND_DISPLAY").is_ok() {
+                LinuxSessionKind::Wayland
+            } else if std::env::var("DISPLAY").is_ok() {
+                LinuxSessionKind::X11
+            } else {
+                LinuxSessionKind::Unknown
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_kde_desktop() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|value| value.to_ascii_lowercase().contains("kde"))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
 fn grab_button(
     conn: &xcb::Connection,
     root: xcb::x::Window,
@@ -209,6 +325,10 @@ fn trigger_button_code(button: TriggerButton) -> x::ButtonIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::ffi::OsString;
+    #[cfg(target_os = "linux")]
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     fn process(name: &str, path: &str) -> FocusedProcess {
         FocusedProcess {
@@ -240,5 +360,76 @@ mod tests {
             TriggerButton::Middle
         );
         assert_eq!(trigger_button_for_process(None), TriggerButton::Middle);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(target_os = "linux")]
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl EnvGuard {
+        fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
+            let lock = env_lock().lock().expect("env test mutex poisoned");
+            let mut saved = Vec::new();
+            for (key, value) in pairs {
+                saved.push((*key, std::env::var_os(key)));
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self { _lock: lock, saved }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_linux_session_kind_prefers_declared_session_type() {
+        let _guard = EnvGuard::set(&[
+            ("XDG_SESSION_TYPE", Some("wayland")),
+            ("WAYLAND_DISPLAY", None),
+            ("DISPLAY", Some(":1")),
+        ]);
+
+        assert_eq!(detect_linux_session_kind(), LinuxSessionKind::Wayland);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detect_linux_session_kind_falls_back_to_display_variables() {
+        let _guard = EnvGuard::set(&[
+            ("XDG_SESSION_TYPE", None),
+            ("WAYLAND_DISPLAY", None),
+            ("DISPLAY", Some(":1")),
+        ]);
+
+        assert_eq!(detect_linux_session_kind(), LinuxSessionKind::X11);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn is_kde_desktop_detects_kde_current_desktop() {
+        let _guard = EnvGuard::set(&[("XDG_CURRENT_DESKTOP", Some("KDE"))]);
+        assert!(is_kde_desktop());
     }
 }

@@ -52,6 +52,9 @@ active-win-pos-rs = "0.10"
 # X11 mouse grab for global radial gestures on Linux
 xcb = "1.7.0"
 
+# KDE Wayland bridge over session D-Bus
+dbus = "0.9"
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = true          # Link-time optimization

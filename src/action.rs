@@ -7,6 +7,10 @@ use std::process::Command;
     not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
 ))]
 use arboard::{GetExtLinux, LinuxClipboardKind};
+#[cfg(test)]
+use std::cell::RefCell;
+#[cfg(test)]
+use std::collections::VecDeque;
 
 /// Represents what happens when an action is triggered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,15 +77,16 @@ pub struct Action {
     #[serde(default)]
     pub description: String,
     #[serde(default)]
-    pub icon: Option<String>, // emoji or icon name
+    pub icon: Option<String>,
     #[serde(default)]
-    pub tags: Vec<String>, // for search
+    pub tags: Vec<String>,
     #[serde(default)]
-    pub hotkey: Option<String>, // e.g. "Ctrl+Shift+T"
+    pub hotkey: Option<String>,
     pub kind: ActionKind,
 }
 
 /// Result of executing an action
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecResult {
     Ok,
     OkWithMessage(String),
@@ -96,39 +101,25 @@ impl Action {
                 command,
                 args,
                 working_dir,
-            } => {
-                let mut cmd = Command::new(command);
-                cmd.args(args);
-                if let Some(dir) = working_dir {
-                    cmd.current_dir(dir);
-                }
-                // Detach: don't wait for child
-                match cmd.spawn() {
-                    Ok(_) => ExecResult::Ok,
-                    Err(e) => ExecResult::Err(format!("Failed to run '{}': {}", command, e)),
-                }
-            }
+            } => spawn_program(command, args, working_dir.as_deref()),
 
             ActionKind::OpenFile { path } | ActionKind::OpenFolder { path } => {
-                match open::that(path) {
+                match open_target(path) {
                     Ok(_) => ExecResult::Ok,
                     Err(e) => ExecResult::Err(format!("Failed to open '{}': {}", path, e)),
                 }
             }
 
-            ActionKind::OpenUrl { url } => match open::that(url) {
+            ActionKind::OpenUrl { url } => match open_target(url) {
                 Ok(_) => ExecResult::Ok,
                 Err(e) => ExecResult::Err(format!("Failed to open URL '{}': {}", url, e)),
             },
 
             ActionKind::RunShell { script, shell } => run_shell_command(script, shell),
 
-            ActionKind::CopyText { text } => match arboard::Clipboard::new() {
-                Ok(mut cb) => match cb.set_text(text) {
-                    Ok(_) => ExecResult::OkWithMessage("Copied to clipboard".into()),
-                    Err(e) => ExecResult::Err(format!("Clipboard error: {}", e)),
-                },
-                Err(e) => ExecResult::Err(format!("Clipboard error: {}", e)),
+            ActionKind::CopyText { text } => match write_clipboard_text(text) {
+                Ok(_) => ExecResult::OkWithMessage("Copied to clipboard".into()),
+                Err(err) => ExecResult::Err(err),
             },
 
             ActionKind::SearchClipboardText { url_template } => {
@@ -142,7 +133,7 @@ impl Action {
                 } else {
                     format!("{url_template}{encoded}")
                 };
-                match open::that(&url) {
+                match open_target(&url) {
                     Ok(_) => ExecResult::OkWithMessage(format!("Searched for: {}", clipboard_text)),
                     Err(e) => {
                         ExecResult::Err(format!("Failed to open search URL '{}': {}", url, e))
@@ -159,7 +150,7 @@ impl Action {
                 };
 
                 if let Some(target) = clipboard_target(&clipboard_text) {
-                    match open::that(&target) {
+                    match open_target(&target) {
                         Ok(_) => ExecResult::OkWithMessage(format!("Opened: {}", clipboard_text)),
                         Err(e) => ExecResult::Err(format!("Failed to open '{}': {}", target, e)),
                     }
@@ -170,7 +161,7 @@ impl Action {
                     } else {
                         format!("{url_template}{encoded}")
                     };
-                    match open::that(&url) {
+                    match open_target(&url) {
                         Ok(_) => {
                             ExecResult::OkWithMessage(format!("Searched for: {}", clipboard_text))
                         }
@@ -195,10 +186,7 @@ impl Action {
                 run_shell_command(&clipboard_text, shell)
             }
 
-            ActionKind::Group { .. } => {
-                // Groups are navigated in the UI, not "executed"
-                ExecResult::Ok
-            }
+            ActionKind::Group { .. } => ExecResult::Ok,
         }
     }
 
@@ -213,10 +201,48 @@ impl Action {
     }
 }
 
+fn spawn_program(command: &str, args: &[String], working_dir: Option<&str>) -> ExecResult {
+    #[cfg(test)]
+    if let Some(result) = test_spawn_program(command, args, working_dir) {
+        return result;
+    }
+
+    let mut cmd = Command::new(command);
+    cmd.args(args);
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+    match cmd.spawn() {
+        Ok(_) => ExecResult::Ok,
+        Err(e) => ExecResult::Err(format!("Failed to run '{}': {}", command, e)),
+    }
+}
+
+fn open_target(target: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = test_open_target(target) {
+        return result;
+    }
+
+    open::that(target).map_err(|e| e.to_string())
+}
+
+fn write_clipboard_text(text: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = test_write_clipboard_text(text) {
+        return result;
+    }
+
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("Clipboard error: {}", e))?;
+    clipboard
+        .set_text(text)
+        .map_err(|e| format!("Clipboard error: {}", e))
+}
+
 fn read_clipboard_text() -> Result<String, String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("Clipboard error: {}", e))?;
 
-    if let Some(text) = normalize_clipboard_text(clipboard.get_text().ok()) {
+    if let Some(text) = read_standard_clipboard_text(&mut clipboard) {
         return Ok(text);
     }
 
@@ -225,13 +251,7 @@ fn read_clipboard_text() -> Result<String, String> {
         not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
     ))]
     {
-        if let Some(text) = normalize_clipboard_text(
-            clipboard
-                .get()
-                .clipboard(LinuxClipboardKind::Primary)
-                .text()
-                .ok(),
-        ) {
+        if let Some(text) = read_primary_clipboard_text(&mut clipboard) {
             return Ok(text);
         }
     }
@@ -239,6 +259,34 @@ fn read_clipboard_text() -> Result<String, String> {
     Err(
         "No usable text was found in the clipboard. On Linux, select text first or copy it explicitly."
             .into(),
+    )
+}
+
+fn read_standard_clipboard_text(clipboard: &mut arboard::Clipboard) -> Option<String> {
+    #[cfg(test)]
+    if let Some(text) = test_read_standard_clipboard_text() {
+        return text;
+    }
+
+    normalize_clipboard_text(clipboard.get_text().ok())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+fn read_primary_clipboard_text(clipboard: &mut arboard::Clipboard) -> Option<String> {
+    #[cfg(test)]
+    if let Some(text) = test_read_primary_clipboard_text() {
+        return text;
+    }
+
+    normalize_clipboard_text(
+        clipboard
+            .get()
+            .clipboard(LinuxClipboardKind::Primary)
+            .text()
+            .ok(),
     )
 }
 
@@ -266,6 +314,11 @@ fn clipboard_target(text: &str) -> Option<String> {
 }
 
 fn run_shell_command(script: &str, shell: &str) -> ExecResult {
+    #[cfg(test)]
+    if let Some(result) = test_run_shell_command(script, shell) {
+        return result;
+    }
+
     let (sh, flag) = if cfg!(target_os = "windows") {
         match shell {
             "cmd" => ("cmd", "/C"),
@@ -298,5 +351,405 @@ fn run_shell_command(script: &str, shell: &str) -> ExecResult {
             }
         }
         Err(e) => ExecResult::Err(format!("Failed to run shell '{}': {}", shell, e)),
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnCall {
+    command: String,
+    args: Vec<String>,
+    working_dir: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ActionTestRuntime {
+    spawn_calls: Vec<SpawnCall>,
+    spawn_results: VecDeque<ExecResult>,
+    opened_targets: Vec<String>,
+    open_results: VecDeque<Result<(), String>>,
+    clipboard_writes: Vec<String>,
+    clipboard_write_results: VecDeque<Result<(), String>>,
+    standard_clipboard_reads: VecDeque<Option<String>>,
+    primary_clipboard_reads: VecDeque<Option<String>>,
+    shell_calls: Vec<(String, String)>,
+    shell_results: VecDeque<ExecResult>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ACTION_TEST_RUNTIME: RefCell<ActionTestRuntime> = RefCell::new(ActionTestRuntime::default());
+}
+
+#[cfg(test)]
+fn with_action_test_runtime<R>(f: impl FnOnce(&mut ActionTestRuntime) -> R) -> R {
+    ACTION_TEST_RUNTIME.with(|runtime| f(&mut runtime.borrow_mut()))
+}
+
+#[cfg(test)]
+fn reset_action_test_runtime() {
+    with_action_test_runtime(|runtime| *runtime = ActionTestRuntime::default());
+}
+
+#[cfg(test)]
+fn test_spawn_program(
+    command: &str,
+    args: &[String],
+    working_dir: Option<&str>,
+) -> Option<ExecResult> {
+    with_action_test_runtime(|runtime| {
+        runtime.spawn_calls.push(SpawnCall {
+            command: command.into(),
+            args: args.to_vec(),
+            working_dir: working_dir.map(str::to_string),
+        });
+        runtime.spawn_results.pop_front()
+    })
+}
+
+#[cfg(test)]
+fn test_open_target(target: &str) -> Option<Result<(), String>> {
+    with_action_test_runtime(|runtime| {
+        runtime.opened_targets.push(target.into());
+        runtime.open_results.pop_front()
+    })
+}
+
+#[cfg(test)]
+fn test_write_clipboard_text(text: &str) -> Option<Result<(), String>> {
+    with_action_test_runtime(|runtime| {
+        runtime.clipboard_writes.push(text.into());
+        runtime.clipboard_write_results.pop_front()
+    })
+}
+
+#[cfg(test)]
+fn test_read_standard_clipboard_text() -> Option<Option<String>> {
+    with_action_test_runtime(|runtime| runtime.standard_clipboard_reads.pop_front())
+}
+
+#[cfg(test)]
+fn test_read_primary_clipboard_text() -> Option<Option<String>> {
+    with_action_test_runtime(|runtime| runtime.primary_clipboard_reads.pop_front())
+}
+
+#[cfg(test)]
+fn test_run_shell_command(script: &str, shell: &str) -> Option<ExecResult> {
+    with_action_test_runtime(|runtime| {
+        runtime.shell_calls.push((shell.into(), script.into()));
+        runtime.shell_results.pop_front()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn action(kind: ActionKind) -> Action {
+        Action {
+            name: "Test".into(),
+            description: "desc".into(),
+            icon: None,
+            tags: vec!["tag".into()],
+            hotkey: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn run_program_executes_with_expected_arguments() {
+        reset_action_test_runtime();
+        with_action_test_runtime(|runtime| runtime.spawn_results.push_back(ExecResult::Ok));
+
+        let result = action(ActionKind::RunProgram {
+            command: "demo".into(),
+            args: vec!["--flag".into()],
+            working_dir: Some("/tmp".into()),
+        })
+        .execute();
+
+        assert_eq!(result, ExecResult::Ok);
+        with_action_test_runtime(|runtime| {
+            assert_eq!(
+                runtime.spawn_calls,
+                vec![SpawnCall {
+                    command: "demo".into(),
+                    args: vec!["--flag".into()],
+                    working_dir: Some("/tmp".into()),
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn open_file_uses_open_target() {
+        reset_action_test_runtime();
+        with_action_test_runtime(|runtime| runtime.open_results.push_back(Ok(())));
+
+        let result = action(ActionKind::OpenFile {
+            path: "/tmp/file.txt".into(),
+        })
+        .execute();
+
+        assert_eq!(result, ExecResult::Ok);
+        with_action_test_runtime(|runtime| {
+            assert_eq!(runtime.opened_targets, vec!["/tmp/file.txt"]);
+        });
+    }
+
+    #[test]
+    fn open_url_uses_open_target() {
+        reset_action_test_runtime();
+        with_action_test_runtime(|runtime| runtime.open_results.push_back(Ok(())));
+
+        let result = action(ActionKind::OpenUrl {
+            url: "https://example.com".into(),
+        })
+        .execute();
+
+        assert_eq!(result, ExecResult::Ok);
+        with_action_test_runtime(|runtime| {
+            assert_eq!(runtime.opened_targets, vec!["https://example.com"]);
+        });
+    }
+
+    #[test]
+    fn run_shell_returns_hooked_output() {
+        reset_action_test_runtime();
+        with_action_test_runtime(|runtime| {
+            runtime
+                .shell_results
+                .push_back(ExecResult::OkWithMessage("done".into()))
+        });
+
+        let result = action(ActionKind::RunShell {
+            script: "echo hi".into(),
+            shell: "sh".into(),
+        })
+        .execute();
+
+        assert_eq!(result, ExecResult::OkWithMessage("done".into()));
+        with_action_test_runtime(|runtime| {
+            assert_eq!(runtime.shell_calls, vec![("sh".into(), "echo hi".into())]);
+        });
+    }
+
+    #[test]
+    fn copy_text_writes_clipboard() {
+        reset_action_test_runtime();
+        with_action_test_runtime(|runtime| runtime.clipboard_write_results.push_back(Ok(())));
+
+        let result = action(ActionKind::CopyText {
+            text: "hello".into(),
+        })
+        .execute();
+
+        assert_eq!(
+            result,
+            ExecResult::OkWithMessage("Copied to clipboard".into())
+        );
+        with_action_test_runtime(|runtime| {
+            assert_eq!(runtime.clipboard_writes, vec!["hello"]);
+        });
+    }
+
+    #[test]
+    fn open_folder_uses_open_target() {
+        reset_action_test_runtime();
+        with_action_test_runtime(|runtime| runtime.open_results.push_back(Ok(())));
+
+        let result = action(ActionKind::OpenFolder {
+            path: "/tmp".into(),
+        })
+        .execute();
+
+        assert_eq!(result, ExecResult::Ok);
+        with_action_test_runtime(|runtime| {
+            assert_eq!(runtime.opened_targets, vec!["/tmp"]);
+        });
+    }
+
+    #[test]
+    fn search_clipboard_text_builds_query_url() {
+        reset_action_test_runtime();
+        with_action_test_runtime(|runtime| {
+            runtime
+                .standard_clipboard_reads
+                .push_back(Some("hello world".into()));
+            runtime.open_results.push_back(Ok(()));
+        });
+
+        let result = action(ActionKind::SearchClipboardText {
+            url_template: "https://search.example/?q={query}".into(),
+        })
+        .execute();
+
+        assert_eq!(
+            result,
+            ExecResult::OkWithMessage("Searched for: hello world".into())
+        );
+        with_action_test_runtime(|runtime| {
+            assert_eq!(
+                runtime.opened_targets,
+                vec!["https://search.example/?q=hello%20world"]
+            );
+        });
+    }
+
+    #[test]
+    fn open_clipboard_text_opens_direct_url() {
+        reset_action_test_runtime();
+        with_action_test_runtime(|runtime| {
+            runtime
+                .standard_clipboard_reads
+                .push_back(Some("https://example.com".into()));
+            runtime.open_results.push_back(Ok(()));
+        });
+
+        let result = action(ActionKind::OpenClipboardText {
+            fallback_search_url: Some("https://search.example/?q={query}".into()),
+        })
+        .execute();
+
+        assert_eq!(
+            result,
+            ExecResult::OkWithMessage("Opened: https://example.com".into())
+        );
+        with_action_test_runtime(|runtime| {
+            assert_eq!(runtime.opened_targets, vec!["https://example.com"]);
+        });
+    }
+
+    #[test]
+    fn open_clipboard_text_uses_existing_path() {
+        reset_action_test_runtime();
+        let temp_path = std::env::temp_dir().join("quicker-rs-open-clipboard-test.txt");
+        fs::write(&temp_path, "demo").unwrap();
+        with_action_test_runtime(|runtime| {
+            runtime
+                .standard_clipboard_reads
+                .push_back(Some(temp_path.to_string_lossy().to_string()));
+            runtime.open_results.push_back(Ok(()));
+        });
+
+        let result = action(ActionKind::OpenClipboardText {
+            fallback_search_url: None,
+        })
+        .execute();
+
+        assert_eq!(
+            result,
+            ExecResult::OkWithMessage(format!("Opened: {}", temp_path.display()))
+        );
+        with_action_test_runtime(|runtime| {
+            assert_eq!(
+                runtime.opened_targets,
+                vec![temp_path.to_string_lossy().to_string()]
+            );
+        });
+        let _ = fs::remove_file(temp_path);
+    }
+
+    #[test]
+    fn open_clipboard_text_uses_fallback_search() {
+        reset_action_test_runtime();
+        with_action_test_runtime(|runtime| {
+            runtime
+                .standard_clipboard_reads
+                .push_back(Some("need search".into()));
+            runtime.open_results.push_back(Ok(()));
+        });
+
+        let result = action(ActionKind::OpenClipboardText {
+            fallback_search_url: Some("https://search.example/?q={query}".into()),
+        })
+        .execute();
+
+        assert_eq!(
+            result,
+            ExecResult::OkWithMessage("Searched for: need search".into())
+        );
+        with_action_test_runtime(|runtime| {
+            assert_eq!(
+                runtime.opened_targets,
+                vec!["https://search.example/?q=need%20search"]
+            );
+        });
+    }
+
+    #[test]
+    fn open_clipboard_text_errors_without_fallback() {
+        reset_action_test_runtime();
+        with_action_test_runtime(|runtime| {
+            runtime
+                .standard_clipboard_reads
+                .push_back(Some("not a target".into()));
+        });
+
+        let result = action(ActionKind::OpenClipboardText {
+            fallback_search_url: None,
+        })
+        .execute();
+
+        assert_eq!(
+            result,
+            ExecResult::Err(
+                "Clipboard does not contain a URL or existing path, and no fallback search URL is configured"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn run_clipboard_text_reads_primary_selection_when_standard_clipboard_is_empty() {
+        reset_action_test_runtime();
+        with_action_test_runtime(|runtime| {
+            runtime.standard_clipboard_reads.push_back(None);
+            runtime
+                .primary_clipboard_reads
+                .push_back(Some("echo selected".into()));
+            runtime.shell_results.push_back(ExecResult::Ok);
+        });
+
+        let result = action(ActionKind::RunClipboardText { shell: "sh".into() }).execute();
+
+        assert_eq!(result, ExecResult::Ok);
+        with_action_test_runtime(|runtime| {
+            assert_eq!(
+                runtime.shell_calls,
+                vec![("sh".into(), "echo selected".into())]
+            );
+        });
+    }
+
+    #[test]
+    fn group_actions_are_not_executed() {
+        reset_action_test_runtime();
+        let result = action(ActionKind::Group { actions: vec![] }).execute();
+        assert_eq!(result, ExecResult::Ok);
+    }
+
+    #[test]
+    fn search_text_includes_group_children() {
+        let grouped = action(ActionKind::Group {
+            actions: vec![Action {
+                name: "Child".into(),
+                description: "Nested".into(),
+                icon: None,
+                tags: vec!["inside".into()],
+                hotkey: None,
+                kind: ActionKind::CopyText {
+                    text: "copy".into(),
+                },
+            }],
+        });
+
+        let text = grouped.search_text();
+
+        assert!(text.contains("Child"));
+        assert!(text.contains("Nested"));
+        assert!(text.contains("inside"));
     }
 }

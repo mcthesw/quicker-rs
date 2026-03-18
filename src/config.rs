@@ -451,3 +451,97 @@ fn is_legacy_default_profile(profile: &Profile) -> bool {
             .map(|action| action.name.as_str())
             .eq(LEGACY_DEFAULT_ACTIONS)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn action_named(name: &str) -> Action {
+        Action {
+            name: name.into(),
+            description: String::new(),
+            icon: None,
+            tags: vec![],
+            hotkey: None,
+            kind: ActionKind::CopyText { text: name.into() },
+        }
+    }
+
+    #[test]
+    fn migrate_loaded_replaces_legacy_default_profile() {
+        let cfg = Config {
+            toggle_hotkey: "Alt+Space".into(),
+            columns: 4,
+            panel_width: 600.0,
+            panel_height: 500.0,
+            profiles: vec![Profile {
+                name: "Default".into(),
+                description: String::new(),
+                match_processes: vec![],
+                actions: vec![
+                    action_named("Terminal"),
+                    action_named("File Manager"),
+                    action_named("Web Browser"),
+                    action_named("System Info"),
+                    action_named("IP Address"),
+                    action_named("Clipboard History"),
+                ],
+            }],
+        };
+
+        let (migrated, changed) = Config::migrate_loaded(cfg);
+
+        assert!(changed);
+        let names: Vec<_> = migrated.profiles[0]
+            .actions
+            .iter()
+            .map(|action| action.name.as_str())
+            .collect();
+        assert!(names.contains(&"Desktop Tools"));
+        assert!(names.contains(&"Web Shortcuts"));
+        assert!(names.contains(&"Quick Search"));
+    }
+
+    #[test]
+    fn migrate_loaded_appends_missing_pdf_demo_actions_without_duplication() {
+        let cfg = Config {
+            toggle_hotkey: "Alt+Space".into(),
+            columns: 4,
+            panel_width: 600.0,
+            panel_height: 500.0,
+            profiles: vec![Profile {
+                name: "Custom".into(),
+                description: String::new(),
+                match_processes: vec![],
+                actions: vec![pdf_demo_actions()[0].clone()],
+            }],
+        };
+
+        let (migrated, changed) = Config::migrate_loaded(cfg);
+
+        assert!(changed);
+        let names: Vec<_> = migrated.profiles[0]
+            .actions
+            .iter()
+            .map(|action| action.name.as_str())
+            .collect();
+        assert_eq!(
+            names.iter().filter(|name| **name == "Quick Search").count(),
+            1
+        );
+        assert!(names.contains(&"Smart Open Clipboard"));
+        assert!(names.contains(&"Run Clipboard Text"));
+    }
+
+    #[test]
+    fn example_actions_contains_pdf_demo_actions() {
+        let names: Vec<_> = example_actions()
+            .into_iter()
+            .map(|action| action.name)
+            .collect();
+
+        assert!(names.contains(&"Quick Search".into()));
+        assert!(names.contains(&"Smart Open Clipboard".into()));
+        assert!(names.contains(&"Run Clipboard Text".into()));
+    }
+}

@@ -1,5 +1,5 @@
 use crate::action::{Action, ActionKind};
-use crate::focus::FocusedProcess;
+use crate::focus::{normalize_process_name, FocusedProcess, BROWSER_PROCESS_PATTERNS};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -116,6 +116,11 @@ impl Config {
             }
         }
 
+        if !cfg.profiles.iter().skip(1).any(has_browser_match_process) {
+            cfg.profiles.push(default_browser_profile());
+            changed = true;
+        }
+
         (cfg, changed)
     }
 
@@ -160,12 +165,15 @@ impl Default for Config {
             columns: default_columns(),
             panel_width: default_width(),
             panel_height: default_height(),
-            profiles: vec![Profile {
-                name: "Default".into(),
-                description: "General-purpose actions".into(),
-                match_processes: vec![],
-                actions: example_actions(),
-            }],
+            profiles: vec![
+                Profile {
+                    name: "Default".into(),
+                    description: "General-purpose actions".into(),
+                    match_processes: vec![],
+                    actions: example_actions(),
+                },
+                default_browser_profile(),
+            ],
         }
     }
 }
@@ -452,6 +460,142 @@ fn pdf_demo_actions() -> Vec<Action> {
     ]
 }
 
+fn default_browser_profile() -> Profile {
+    Profile {
+        name: "Browser".into(),
+        description: "Actions shown when a web browser is focused".into(),
+        match_processes: BROWSER_PROCESS_PATTERNS
+            .iter()
+            .map(|pattern| (*pattern).to_string())
+            .collect(),
+        actions: browser_actions(),
+    }
+}
+
+fn browser_actions() -> Vec<Action> {
+    vec![
+        Action {
+            name: "Quick Search".into(),
+            description: "Search the selected or copied text on Google".into(),
+            icon: Some("🔎".into()),
+            tags: vec!["search".into(), "clipboard".into(), "browser".into()],
+            hotkey: None,
+            kind: ActionKind::SearchClipboardText {
+                url_template: "https://www.google.com/search?q={query}".into(),
+            },
+        },
+        Action {
+            name: "Search YouTube".into(),
+            description: "Search the selected or copied text on YouTube".into(),
+            icon: Some("▶".into()),
+            tags: vec!["search".into(), "youtube".into(), "video".into()],
+            hotkey: None,
+            kind: ActionKind::SearchClipboardText {
+                url_template: "https://www.youtube.com/results?search_query={query}".into(),
+            },
+        },
+        Action {
+            name: "Search Wikipedia".into(),
+            description: "Search the selected or copied text on Wikipedia".into(),
+            icon: Some("📚".into()),
+            tags: vec!["search".into(), "wiki".into(), "knowledge".into()],
+            hotkey: None,
+            kind: ActionKind::SearchClipboardText {
+                url_template: "https://en.wikipedia.org/w/index.php?search={query}".into(),
+            },
+        },
+        Action {
+            name: "Translate Clipboard".into(),
+            description: "Translate the selected or copied text in Google Translate".into(),
+            icon: Some("🌍".into()),
+            tags: vec!["translate".into(), "clipboard".into(), "browser".into()],
+            hotkey: None,
+            kind: ActionKind::SearchClipboardText {
+                url_template:
+                    "https://translate.google.com/?sl=auto&tl=auto&text={query}&op=translate".into(),
+            },
+        },
+        Action {
+            name: "Smart Open Clipboard".into(),
+            description: "Open the clipboard as a URL/path, or search for it if needed".into(),
+            icon: Some("🧠".into()),
+            tags: vec![
+                "clipboard".into(),
+                "url".into(),
+                "link".into(),
+                "smart".into(),
+            ],
+            hotkey: None,
+            kind: ActionKind::OpenClipboardText {
+                fallback_search_url: Some("https://www.google.com/search?q={query}".into()),
+            },
+        },
+        Action {
+            name: "Web Shortcuts".into(),
+            description: "Grouped browser and web shortcuts".into(),
+            icon: Some("🌐".into()),
+            tags: vec!["web".into(), "browser".into(), "group".into()],
+            hotkey: None,
+            kind: ActionKind::Group {
+                actions: vec![
+                    Action {
+                        name: "Open Browser Home".into(),
+                        description: "Open your default browser home page".into(),
+                        icon: Some("🏠".into()),
+                        tags: vec!["browser".into(), "home".into()],
+                        hotkey: None,
+                        kind: ActionKind::OpenUrl {
+                            url: "https://google.com".into(),
+                        },
+                    },
+                    Action {
+                        name: "GitHub".into(),
+                        description: "Open GitHub".into(),
+                        icon: Some("🐙".into()),
+                        tags: vec!["git".into(), "code".into(), "repo".into()],
+                        hotkey: None,
+                        kind: ActionKind::OpenUrl {
+                            url: "https://github.com".into(),
+                        },
+                    },
+                    Action {
+                        name: "MDN Web Docs".into(),
+                        description: "Open MDN documentation".into(),
+                        icon: Some("📘".into()),
+                        tags: vec!["docs".into(), "web".into(), "mdn".into()],
+                        hotkey: None,
+                        kind: ActionKind::OpenUrl {
+                            url: "https://developer.mozilla.org".into(),
+                        },
+                    },
+                    Action {
+                        name: "YouTube".into(),
+                        description: "Open YouTube".into(),
+                        icon: Some("🎬".into()),
+                        tags: vec!["video".into(), "youtube".into(), "watch".into()],
+                        hotkey: None,
+                        kind: ActionKind::OpenUrl {
+                            url: "https://www.youtube.com".into(),
+                        },
+                    },
+                ],
+            },
+        },
+    ]
+}
+
+fn has_browser_match_process(profile: &Profile) -> bool {
+    profile
+        .match_processes
+        .iter()
+        .filter_map(|pattern| normalize_process_name(pattern))
+        .any(|pattern| {
+            BROWSER_PROCESS_PATTERNS
+                .iter()
+                .any(|browser| pattern == *browser)
+        })
+}
+
 fn is_legacy_default_profile(profile: &Profile) -> bool {
     const LEGACY_DEFAULT_ACTIONS: [&str; 6] = [
         "Terminal",
@@ -571,6 +715,39 @@ mod tests {
         assert!(names.contains(&"Quick Search".into()));
         assert!(names.contains(&"Smart Open Clipboard".into()));
         assert!(names.contains(&"Run Clipboard Text".into()));
+    }
+
+    #[test]
+    fn default_config_includes_browser_profile() {
+        let cfg = Config::default();
+
+        assert_eq!(cfg.profiles.len(), 2);
+        assert_eq!(cfg.profiles[1].name, "Browser");
+        assert!(cfg.profiles[1].matches_process(&focused_process("Firefox", "/usr/bin/firefox")));
+    }
+
+    #[test]
+    fn migrate_loaded_adds_browser_profile_when_missing() {
+        let cfg = Config {
+            toggle_hotkey: "Alt+Space".into(),
+            columns: 4,
+            panel_width: 600.0,
+            panel_height: 500.0,
+            profiles: vec![Profile {
+                name: "Default".into(),
+                description: String::new(),
+                match_processes: vec![],
+                actions: example_actions(),
+            }],
+        };
+
+        let (migrated, changed) = Config::migrate_loaded(cfg);
+
+        assert!(changed);
+        assert!(migrated
+            .profiles
+            .iter()
+            .any(|profile| profile.name == "Browser"));
     }
 
     #[test]

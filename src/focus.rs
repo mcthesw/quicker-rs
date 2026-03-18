@@ -1,6 +1,19 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+pub const BROWSER_PROCESS_PATTERNS: &[&str] = &[
+    "chrome",
+    "chromium",
+    "firefox",
+    "msedge",
+    "edge",
+    "brave-browser",
+    "opera",
+    "vivaldi",
+    "zen",
+    "safari",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusedProcess {
     pub app_name: String,

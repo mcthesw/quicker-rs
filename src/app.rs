@@ -238,7 +238,14 @@ impl QuickerApp {
             return;
         };
 
-        let profile_idx = self.config.matching_profile_index(&process).unwrap_or(0);
+        self.sync_profile_to_process(&process);
+    }
+
+    fn sync_profile_to_process(&mut self, process: &focus::FocusedProcess) {
+        let profile_idx = self
+            .config
+            .matching_profile_index(process)
+            .unwrap_or(self.global_profile_idx());
         self.set_active_profile(profile_idx);
     }
 
@@ -409,13 +416,36 @@ impl QuickerApp {
         self.query.clear();
     }
 
-    fn radial_entries(&self) -> Vec<RadialMenuEntry> {
-        let entries = self.current_action_entries();
-        let results = self.filtered_entries(&entries);
+    fn radial_entries(&self, source: RadialMenuSource) -> Vec<RadialMenuEntry> {
+        let entries = match source {
+            RadialMenuSource::LocalPointer => {
+                let entries = self.current_action_entries();
+                let results = self.filtered_entries(&entries);
+                if results.is_empty() {
+                    entries
+                } else {
+                    results
+                }
+            }
+            RadialMenuSource::GlobalTrigger => {
+                let mut entries = Vec::new();
+                if let Some(profile_idx) = self.active_window_profile_index() {
+                    entries.extend(self.action_entries(
+                        profile_idx,
+                        ActionSection::ActiveWindowTools,
+                        self.profile_actions(profile_idx),
+                    ));
+                }
+                entries.extend(self.action_entries(
+                    self.global_profile_idx(),
+                    ActionSection::GlobalTools,
+                    self.profile_actions(self.global_profile_idx()),
+                ));
+                entries
+            }
+        };
 
-        let visible_entries = if results.is_empty() { entries } else { results };
-
-        visible_entries
+        entries
             .into_iter()
             .map(|entry| RadialMenuEntry {
                 profile_idx: entry.profile_idx,
@@ -427,7 +457,7 @@ impl QuickerApp {
     }
 
     fn start_local_radial_menu(&mut self, ctx: &egui::Context, pointer: egui::Pos2) {
-        let entries = self.radial_entries();
+        let entries = self.radial_entries(RadialMenuSource::LocalPointer);
         if entries.is_empty() {
             return;
         }
@@ -457,7 +487,7 @@ impl QuickerApp {
     }
 
     fn start_global_radial_menu(&mut self, ctx: &egui::Context, screen_pos: egui::Pos2) {
-        let entries = self.radial_entries();
+        let entries = self.radial_entries(RadialMenuSource::GlobalTrigger);
         if entries.is_empty() {
             return;
         }
@@ -716,6 +746,7 @@ impl QuickerApp {
             }
 
             egui::ScrollArea::vertical()
+                .id_salt(format!("{section_id}_scroll"))
                 .max_height((height - 32.0).max(80.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -815,6 +846,7 @@ impl QuickerApp {
             }
 
             egui::ScrollArea::vertical()
+                .id_salt("action_scope_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     self.render_action_results_grid(ui, "action_grid", &entries)
@@ -919,7 +951,9 @@ impl QuickerApp {
         });
         ui.separator();
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("settings_scroll")
+            .show(ui, |ui| {
             let current_process = self.focus_tracker.current_external().cloned();
             let current_process_alias = current_process.as_ref().map(|process| process.primary_alias());
             let current_process_label = current_process
@@ -1057,7 +1091,7 @@ impl QuickerApp {
                         .small(),
                 );
             });
-        });
+            });
     }
 
     fn render_action_editor(&mut self, ui: &mut egui::Ui) {
@@ -1070,7 +1104,9 @@ impl QuickerApp {
         });
         ui.separator();
 
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .id_salt("action_editor_scroll")
+            .show(ui, |ui| {
             ui.label(
                 egui::RichText::new(format!("Adding into: {}", self.add_action_target_label()))
                     .weak()
@@ -1264,7 +1300,7 @@ impl QuickerApp {
                 self.view = View::Panel;
                 self.needs_focus_profile_sync = true;
             }
-        });
+            });
     }
 
     fn render_script_output(&mut self, ui: &mut egui::Ui) {
@@ -1282,13 +1318,15 @@ impl QuickerApp {
             }
         });
         ui.separator();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut self.script_output.as_str())
-                    .desired_width(f32::INFINITY)
-                    .code_editor(),
-            );
-        });
+        egui::ScrollArea::vertical()
+            .id_salt("script_output_scroll")
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.script_output.as_str())
+                        .desired_width(f32::INFINITY)
+                        .code_editor(),
+                );
+            });
     }
 
     fn render_toast(&mut self, ctx: &egui::Context) {
@@ -1329,6 +1367,14 @@ impl QuickerApp {
                     button,
                     process,
                 } => {
+                    let gesture_process = process.clone().or_else(focus::detect_focused_process);
+                    if let Some(process) = gesture_process.as_ref() {
+                        self.focus_tracker.observe(Some(process.clone()));
+                        self.sync_profile_to_process(process);
+                    } else {
+                        self.set_active_profile(self.global_profile_idx());
+                    }
+
                     tracing::debug!("global gesture start: {:?} for {:?}", button, process);
                     self.start_global_radial_menu(ctx, egui::pos2(screen_pos.0, screen_pos.1));
                 }

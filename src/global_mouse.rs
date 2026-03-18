@@ -83,12 +83,7 @@ pub fn trigger_button_for_process(process: Option<&FocusedProcess>) -> TriggerBu
         return TriggerButton::Middle;
     };
 
-    let browser_patterns = [
-        "chrome", "chromium", "firefox", "msedge", "edge", "brave", "opera", "vivaldi", "zen",
-        "safari",
-    ];
-
-    if browser_patterns
+    if focus::BROWSER_PROCESS_PATTERNS
         .iter()
         .any(|pattern| process.matches_pattern(pattern))
     {

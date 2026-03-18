@@ -49,6 +49,9 @@ urlencoding = "2"
 # Focused window / process detection for app-aware profiles
 active-win-pos-rs = "0.10"
 
+# X11 mouse grab for global radial gestures on Linux
+xcb = "1.7.0"
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = true          # Link-time optimization

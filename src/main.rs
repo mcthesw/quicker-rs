@@ -2,6 +2,7 @@ mod action;
 mod app;
 mod config;
 mod focus;
+mod global_mouse;
 mod search;
 
 use app::QuickerApp;

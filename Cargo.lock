@@ -2655,6 +2655,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "which 7.0.3",
+ "xcb",
 ]
 
 [[package]]

@@ -46,6 +46,9 @@ arboard = "3"
 # URL encoding for search actions
 urlencoding = "2"
 
+# Focused window / process detection for app-aware profiles
+active-win-pos-rs = "0.10"
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = true          # Link-time optimization

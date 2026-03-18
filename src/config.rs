@@ -1,4 +1,5 @@
 use crate::action::{Action, ActionKind};
+use crate::focus::FocusedProcess;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -118,6 +119,14 @@ impl Config {
         (cfg, changed)
     }
 
+    pub fn matching_profile_index(&self, process: &FocusedProcess) -> Option<usize> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .find(|(_, profile)| profile.matches_process(process))
+            .map(|(idx, _)| idx)
+    }
+
     /// Save config to disk.
     pub fn save(&self) {
         let path = Self::config_path();
@@ -131,6 +140,16 @@ impl Config {
             }
             Err(e) => tracing::error!("Failed to serialize config: {e}"),
         }
+    }
+}
+
+impl Profile {
+    pub fn matches_process(&self, process: &FocusedProcess) -> bool {
+        !self.match_processes.is_empty()
+            && self
+                .match_processes
+                .iter()
+                .any(|pattern| process.matches_pattern(pattern))
     }
 }
 
@@ -455,6 +474,7 @@ fn is_legacy_default_profile(profile: &Profile) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::focus::FocusedProcess;
 
     fn action_named(name: &str) -> Action {
         Action {
@@ -464,6 +484,14 @@ mod tests {
             tags: vec![],
             hotkey: None,
             kind: ActionKind::CopyText { text: name.into() },
+        }
+    }
+
+    fn focused_process(name: &str, path: &str) -> FocusedProcess {
+        FocusedProcess {
+            app_name: name.into(),
+            process_id: 123,
+            process_path: path.into(),
         }
     }
 
@@ -543,5 +571,62 @@ mod tests {
         assert!(names.contains(&"Quick Search".into()));
         assert!(names.contains(&"Smart Open Clipboard".into()));
         assert!(names.contains(&"Run Clipboard Text".into()));
+    }
+
+    #[test]
+    fn profile_matches_process_against_configured_names() {
+        let profile = Profile {
+            name: "Dev".into(),
+            description: String::new(),
+            match_processes: vec!["code".into(), "zed.exe".into()],
+            actions: vec![],
+        };
+
+        assert!(profile.matches_process(&focused_process("Code", "/usr/bin/code")));
+        assert!(profile.matches_process(&focused_process("Zed", "C:/Program Files/Zed/zed.exe")));
+        assert!(!profile.matches_process(&focused_process("Firefox", "/usr/bin/firefox")));
+    }
+
+    #[test]
+    fn matching_profile_index_returns_first_profile_match() {
+        let cfg = Config {
+            toggle_hotkey: "Alt+Space".into(),
+            columns: 4,
+            panel_width: 600.0,
+            panel_height: 500.0,
+            profiles: vec![
+                Profile {
+                    name: "Default".into(),
+                    description: String::new(),
+                    match_processes: vec![],
+                    actions: vec![],
+                },
+                Profile {
+                    name: "Code".into(),
+                    description: String::new(),
+                    match_processes: vec!["code".into()],
+                    actions: vec![],
+                },
+                Profile {
+                    name: "Browser".into(),
+                    description: String::new(),
+                    match_processes: vec!["firefox".into()],
+                    actions: vec![],
+                },
+            ],
+        };
+
+        assert_eq!(
+            cfg.matching_profile_index(&focused_process("Code", "/usr/bin/code")),
+            Some(1)
+        );
+        assert_eq!(
+            cfg.matching_profile_index(&focused_process("Firefox", "/usr/bin/firefox")),
+            Some(2)
+        );
+        assert_eq!(
+            cfg.matching_profile_index(&focused_process("Slack", "/usr/bin/slack")),
+            None
+        );
     }
 }

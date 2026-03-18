@@ -1,7 +1,11 @@
 use crate::action::{Action, ActionKind, ExecResult};
 use crate::config::Config;
+use crate::focus::{self, FocusTracker};
 use crate::search::SearchEngine;
 use eframe::egui;
+use std::time::{Duration, Instant};
+
+const FOCUS_POLL_INTERVAL: Duration = Duration::from_millis(800);
 
 /// Notification that disappears after a timeout.
 struct Toast {
@@ -25,6 +29,9 @@ pub struct QuickerApp {
     search: SearchEngine,
     query: String,
     active_profile: usize,
+    focus_tracker: FocusTracker,
+    last_focus_poll: Instant,
+    needs_focus_profile_sync: bool,
     group_path: Vec<usize>,
     view: View,
     toast: Option<Toast>,
@@ -59,6 +66,9 @@ impl QuickerApp {
             search: SearchEngine::new(),
             query: String::new(),
             active_profile: 0,
+            focus_tracker: FocusTracker::new(std::process::id()),
+            last_focus_poll: Instant::now() - FOCUS_POLL_INTERVAL,
+            needs_focus_profile_sync: true,
             group_path: Vec::new(),
             view: View::Panel,
             toast: None,
@@ -99,6 +109,34 @@ impl QuickerApp {
                 self.show_toast(e, true);
             }
         }
+    }
+
+    fn set_active_profile(&mut self, profile_idx: usize) {
+        if self.active_profile != profile_idx {
+            self.active_profile = profile_idx;
+            self.group_path.clear();
+            self.query.clear();
+        }
+    }
+
+    fn poll_focused_process(&mut self) {
+        if self.last_focus_poll.elapsed() < FOCUS_POLL_INTERVAL {
+            return;
+        }
+
+        self.last_focus_poll = Instant::now();
+        if self.focus_tracker.observe(focus::detect_focused_process()) {
+            self.needs_focus_profile_sync = true;
+        }
+    }
+
+    fn sync_profile_to_focus(&mut self) {
+        let Some(process) = self.focus_tracker.current_external().cloned() else {
+            return;
+        };
+
+        let profile_idx = self.config.matching_profile_index(&process).unwrap_or(0);
+        self.set_active_profile(profile_idx);
     }
 
     fn reset_editor(&mut self) {
@@ -186,13 +224,12 @@ impl QuickerApp {
 
     fn render_panel(&mut self, ui: &mut egui::Ui) {
         // --- Profile tabs ---
+        let mut clicked_profile = None;
         ui.horizontal(|ui| {
             for (i, profile) in self.config.profiles.iter().enumerate() {
                 let selected = i == self.active_profile;
                 if ui.selectable_label(selected, &profile.name).clicked() {
-                    self.active_profile = i;
-                    self.group_path.clear();
-                    self.query.clear();
+                    clicked_profile = Some(i);
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -205,6 +242,10 @@ impl QuickerApp {
                 }
             });
         });
+        if let Some(profile_idx) = clicked_profile {
+            self.set_active_profile(profile_idx);
+            self.needs_focus_profile_sync = false;
+        }
 
         ui.separator();
 
@@ -310,12 +351,21 @@ impl QuickerApp {
         ui.horizontal(|ui| {
             if ui.button("← Back").clicked() {
                 self.view = View::Panel;
+                self.needs_focus_profile_sync = true;
             }
             ui.heading("Settings");
         });
         ui.separator();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            let current_process = self.focus_tracker.current_external().cloned();
+            let current_process_alias = current_process.as_ref().map(|process| process.primary_alias());
+            let current_process_label = current_process
+                .as_ref()
+                .map(|process| process.display_name())
+                .unwrap_or_else(|| "Unavailable".into());
+            let mut profile_rules_changed = false;
+
             ui.label("Toggle Hotkey:");
             ui.text_edit_singleline(&mut self.config.toggle_hotkey);
             ui.add_space(8.0);
@@ -341,24 +391,58 @@ impl QuickerApp {
             ui.add_space(8.0);
 
             ui.heading("Profiles");
+            ui.label(format!("Current focused process: {}", current_process_label));
+            ui.label(
+                egui::RichText::new(
+                    "Profiles with match rules auto-activate. The first profile is the fallback when nothing matches.",
+                )
+                .weak()
+                .small(),
+            );
+            ui.add_space(8.0);
+
             let mut to_delete: Option<usize> = None;
             let can_delete_profiles = self.config.profiles.len() > 1;
             for (i, profile) in self.config.profiles.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     ui.text_edit_singleline(&mut profile.name);
                     ui.label(format!("({} actions)", profile.actions.len()));
+                    if let Some(alias) = current_process_alias.as_deref() {
+                        if ui.small_button(format!("Use {}", alias)).clicked()
+                            && !profile
+                                .match_processes
+                                .iter()
+                                .any(|value| value.eq_ignore_ascii_case(alias))
+                        {
+                            profile.match_processes.push(alias.into());
+                            profile_rules_changed = true;
+                        }
+                    }
                     if can_delete_profiles {
                         if ui.small_button("🗑").clicked() {
                             to_delete = Some(i);
                         }
                     }
                 });
+                let mut process_matches = profile.match_processes.join(", ");
+                ui.label("Match focused processes (comma-separated):");
+                if ui.text_edit_singleline(&mut process_matches).changed() {
+                    profile.match_processes = process_matches
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    profile_rules_changed = true;
+                }
+                ui.add_space(8.0);
             }
             if let Some(idx) = to_delete {
                 self.config.profiles.remove(idx);
                 if self.active_profile >= self.config.profiles.len() {
                     self.active_profile = 0;
                 }
+                self.needs_focus_profile_sync = true;
             }
             if ui.button("Add Profile").clicked() {
                 self.config.profiles.push(crate::config::Profile {
@@ -367,6 +451,11 @@ impl QuickerApp {
                     match_processes: vec![],
                     actions: vec![],
                 });
+                self.needs_focus_profile_sync = true;
+            }
+
+            if profile_rules_changed {
+                self.needs_focus_profile_sync = true;
             }
 
             ui.add_space(16.0);
@@ -377,6 +466,7 @@ impl QuickerApp {
                 if ui.button("💾 Save Config").clicked() {
                     self.config.save();
                     self.show_toast("Config saved!".into(), false);
+                    self.needs_focus_profile_sync = true;
                 }
                 ui.label(
                     egui::RichText::new(format!("Config: {}", Config::config_path().display()))
@@ -391,6 +481,7 @@ impl QuickerApp {
         ui.horizontal(|ui| {
             if ui.button("← Cancel").clicked() {
                 self.view = View::Panel;
+                self.needs_focus_profile_sync = true;
             }
             ui.heading("Add Action");
         });
@@ -581,6 +672,7 @@ impl QuickerApp {
                 self.config.save();
                 self.show_toast("Action added!".into(), false);
                 self.view = View::Panel;
+                self.needs_focus_profile_sync = true;
             }
         });
     }
@@ -589,6 +681,7 @@ impl QuickerApp {
         ui.horizontal(|ui| {
             if ui.button("← Back").clicked() {
                 self.view = View::Panel;
+                self.needs_focus_profile_sync = true;
             }
             ui.heading("Script Output");
             if ui.button("📋 Copy").clicked() {
@@ -645,9 +738,16 @@ impl eframe::App for QuickerApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.view != View::Panel {
                 self.view = View::Panel;
+                self.needs_focus_profile_sync = true;
             } else if !self.group_path.is_empty() {
                 self.leave_group();
             }
+        }
+
+        self.poll_focused_process();
+        if self.view == View::Panel && self.needs_focus_profile_sync {
+            self.sync_profile_to_focus();
+            self.needs_focus_profile_sync = false;
         }
 
         egui::CentralPanel::default().show(ctx, |ui| match self.view {
@@ -658,5 +758,6 @@ impl eframe::App for QuickerApp {
         });
 
         self.render_toast(ctx);
+        ctx.request_repaint_after(FOCUS_POLL_INTERVAL);
     }
 }

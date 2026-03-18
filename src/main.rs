@@ -1,6 +1,7 @@
 mod action;
 mod app;
 mod config;
+mod focus;
 mod search;
 
 use app::QuickerApp;

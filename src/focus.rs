@@ -7,7 +7,7 @@ pub const BROWSER_PROCESS_PATTERNS: &[&str] = &[
     "firefox",
     "msedge",
     "edge",
-    "brave-browser",
+    "brave",
     "opera",
     "vivaldi",
     "zen",
@@ -27,7 +27,17 @@ impl FocusedProcess {
             return false;
         };
 
-        self.aliases().iter().any(|alias| alias == &pattern)
+        if self.aliases().iter().any(|alias| alias == &pattern) {
+            return true;
+        }
+
+        let Some(pattern_browser_family) = browser_family(&pattern) else {
+            return false;
+        };
+
+        self.aliases()
+            .iter()
+            .any(|alias| browser_family(alias) == Some(pattern_browser_family))
     }
 
     pub fn primary_alias(&self) -> String {
@@ -118,11 +128,43 @@ pub fn normalize_process_name(value: &str) -> Option<String> {
     )
 }
 
+pub fn is_browser_process(process: &FocusedProcess) -> bool {
+    process
+        .aliases()
+        .iter()
+        .any(|alias| browser_family(alias).is_some())
+}
+
+pub fn browser_family(value: &str) -> Option<&'static str> {
+    let normalized = normalize_process_name(value)?;
+
+    match_browser_token(&normalized).or_else(|| {
+        normalized
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .find_map(match_browser_token)
+    })
+}
+
 fn push_alias(aliases: &mut BTreeSet<String>, value: &str) {
     let Some(alias) = normalize_process_name(value) else {
         return;
     };
     aliases.insert(alias);
+}
+
+fn match_browser_token(token: &str) -> Option<&'static str> {
+    match token {
+        "chrome" => Some("chrome"),
+        "chromium" => Some("chromium"),
+        "firefox" => Some("firefox"),
+        "msedge" | "edge" => Some("edge"),
+        "brave" | "bravebrowser" => Some("brave"),
+        "opera" => Some("opera"),
+        "vivaldi" => Some("vivaldi"),
+        "zen" => Some("zen"),
+        "safari" => Some("safari"),
+        _ => None,
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -167,6 +209,28 @@ mod tests {
         let process = process("Firefox", 42, "/usr/bin/firefox");
 
         assert_eq!(process.primary_alias(), "firefox");
+    }
+
+    #[test]
+    fn matches_browser_patterns_against_common_browser_variants() {
+        let chrome = process("Google Chrome", 42, "/usr/bin/google-chrome-stable");
+        let firefox = process("Firefox ESR", 42, "/usr/bin/firefox-esr");
+        let brave = process("Brave Browser", 42, "/opt/brave.com/brave/brave");
+
+        assert!(chrome.matches_pattern("chrome"));
+        assert!(firefox.matches_pattern("firefox"));
+        assert!(brave.matches_pattern("brave-browser"));
+        assert!(is_browser_process(&chrome));
+        assert!(is_browser_process(&firefox));
+        assert!(is_browser_process(&brave));
+    }
+
+    #[test]
+    fn non_browser_patterns_still_require_exact_alias_matches() {
+        let process = process("Code OSS", 42, "/usr/bin/code-oss");
+
+        assert!(!process.matches_pattern("code"));
+        assert!(!is_browser_process(&process));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::action::{Action, ActionKind};
-use crate::focus::{normalize_process_name, FocusedProcess, BROWSER_PROCESS_PATTERNS};
+use crate::focus::{browser_family, FocusedProcess, BROWSER_PROCESS_PATTERNS};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -588,12 +588,7 @@ fn has_browser_match_process(profile: &Profile) -> bool {
     profile
         .match_processes
         .iter()
-        .filter_map(|pattern| normalize_process_name(pattern))
-        .any(|pattern| {
-            BROWSER_PROCESS_PATTERNS
-                .iter()
-                .any(|browser| pattern == *browser)
-        })
+        .any(|pattern| browser_family(pattern).is_some())
 }
 
 fn is_legacy_default_profile(profile: &Profile) -> bool {
@@ -751,6 +746,42 @@ mod tests {
     }
 
     #[test]
+    fn migrate_loaded_recognizes_legacy_browser_profile_names() {
+        let cfg = Config {
+            toggle_hotkey: "Alt+Space".into(),
+            columns: 4,
+            panel_width: 600.0,
+            panel_height: 500.0,
+            profiles: vec![
+                Profile {
+                    name: "Default".into(),
+                    description: String::new(),
+                    match_processes: vec![],
+                    actions: example_actions(),
+                },
+                Profile {
+                    name: "Browser".into(),
+                    description: String::new(),
+                    match_processes: vec!["brave-browser".into()],
+                    actions: vec![],
+                },
+            ],
+        };
+
+        let (migrated, changed) = Config::migrate_loaded(cfg);
+
+        assert!(changed);
+        assert_eq!(
+            migrated
+                .profiles
+                .iter()
+                .filter(|profile| profile.name == "Browser")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn profile_matches_process_against_configured_names() {
         let profile = Profile {
             name: "Dev".into(),
@@ -762,6 +793,20 @@ mod tests {
         assert!(profile.matches_process(&focused_process("Code", "/usr/bin/code")));
         assert!(profile.matches_process(&focused_process("Zed", "C:/Program Files/Zed/zed.exe")));
         assert!(!profile.matches_process(&focused_process("Firefox", "/usr/bin/firefox")));
+    }
+
+    #[test]
+    fn browser_profile_matches_browser_variants() {
+        let profile = default_browser_profile();
+
+        assert!(profile.matches_process(&focused_process(
+            "Google Chrome",
+            "/usr/bin/google-chrome-stable"
+        )));
+        assert!(profile.matches_process(&focused_process(
+            "Brave Browser",
+            "/usr/bin/brave-browser"
+        )));
     }
 
     #[test]

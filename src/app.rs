@@ -1,7 +1,6 @@
 use crate::action::{Action, ActionKind, ExecResult};
 use crate::config::Config;
 use crate::focus::{self, FocusTracker};
-use crate::global_mouse::{GlobalMouseEvent, GlobalMouseHook};
 use crate::search::SearchEngine;
 use eframe::egui;
 use global_hotkey::hotkey::HotKey;
@@ -18,7 +17,6 @@ const RADIAL_INNER_RADIUS: f32 = 108.0;
 const RADIAL_OUTER_RADIUS: f32 = 168.0;
 const RADIAL_SELECTION_PADDING: f32 = 28.0;
 const RADIAL_OVERLAY_MARGIN: f32 = RADIAL_OUTER_RADIUS + 8.0;
-const RADIAL_OVERLAY_SIZE: f32 = RADIAL_OVERLAY_MARGIN * 2.0;
 
 #[derive(Clone)]
 struct RadialMenuEntry {
@@ -26,12 +24,6 @@ struct RadialMenuEntry {
     section: ActionSection,
     action_idx: usize,
     action: Action,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RadialMenuSource {
-    LocalPointer,
-    GlobalTrigger,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,8 +60,6 @@ struct RadialMenuState {
     origin: egui::Pos2,
     pointer: egui::Pos2,
     entries: Vec<RadialMenuEntry>,
-    source: RadialMenuSource,
-    screen_anchor: Option<egui::Pos2>,
 }
 
 /// Notification that disappears after a timeout.
@@ -92,7 +82,6 @@ enum View {
 pub struct QuickerApp {
     config: Config,
     search: SearchEngine,
-    global_mouse_hook: GlobalMouseHook,
     _hotkey_manager: Option<GlobalHotKeyManager>,
     toggle_hotkey: Option<HotKey>,
     query: String,
@@ -141,7 +130,6 @@ impl QuickerApp {
         Self {
             config,
             search: SearchEngine::new(),
-            global_mouse_hook: GlobalMouseHook::new(),
             _hotkey_manager: hotkey_manager,
             toggle_hotkey,
             query: String::new(),
@@ -416,34 +404,10 @@ impl QuickerApp {
         self.query.clear();
     }
 
-    fn radial_entries(&self, source: RadialMenuSource) -> Vec<RadialMenuEntry> {
-        let entries = match source {
-            RadialMenuSource::LocalPointer => {
-                let entries = self.current_action_entries();
-                let results = self.filtered_entries(&entries);
-                if results.is_empty() {
-                    entries
-                } else {
-                    results
-                }
-            }
-            RadialMenuSource::GlobalTrigger => {
-                let mut entries = Vec::new();
-                if let Some(profile_idx) = self.active_window_profile_index() {
-                    entries.extend(self.action_entries(
-                        profile_idx,
-                        ActionSection::ActiveWindowTools,
-                        self.profile_actions(profile_idx),
-                    ));
-                }
-                entries.extend(self.action_entries(
-                    self.global_profile_idx(),
-                    ActionSection::GlobalTools,
-                    self.profile_actions(self.global_profile_idx()),
-                ));
-                entries
-            }
-        };
+    fn radial_entries(&self) -> Vec<RadialMenuEntry> {
+        let entries = self.current_action_entries();
+        let results = self.filtered_entries(&entries);
+        let entries = if results.is_empty() { entries } else { results };
 
         entries
             .into_iter()
@@ -457,7 +421,7 @@ impl QuickerApp {
     }
 
     fn start_local_radial_menu(&mut self, ctx: &egui::Context, pointer: egui::Pos2) {
-        let entries = self.radial_entries(RadialMenuSource::LocalPointer);
+        let entries = self.radial_entries();
         if entries.is_empty() {
             return;
         }
@@ -480,59 +444,8 @@ impl QuickerApp {
             origin,
             pointer,
             entries,
-            source: RadialMenuSource::LocalPointer,
-            screen_anchor: None,
         });
         ctx.request_repaint();
-    }
-
-    fn start_global_radial_menu(&mut self, ctx: &egui::Context, screen_pos: egui::Pos2) {
-        let entries = self.radial_entries(RadialMenuSource::GlobalTrigger);
-        if entries.is_empty() {
-            return;
-        }
-
-        self.radial_menu = Some(RadialMenuState {
-            origin: egui::pos2(RADIAL_OVERLAY_MARGIN, RADIAL_OVERLAY_MARGIN),
-            pointer: egui::pos2(RADIAL_OVERLAY_MARGIN, RADIAL_OVERLAY_MARGIN),
-            entries,
-            source: RadialMenuSource::GlobalTrigger,
-            screen_anchor: Some(screen_pos),
-        });
-
-        self.show_global_overlay(ctx, screen_pos);
-        ctx.request_repaint();
-    }
-
-    fn update_global_radial_menu(&mut self, screen_pos: egui::Pos2) {
-        let Some(menu) = &mut self.radial_menu else {
-            return;
-        };
-        if menu.source != RadialMenuSource::GlobalTrigger {
-            return;
-        }
-
-        let Some(screen_anchor) = menu.screen_anchor else {
-            return;
-        };
-        let delta = screen_pos - screen_anchor;
-        menu.pointer = menu.origin + delta;
-    }
-
-    fn show_global_overlay(&mut self, ctx: &egui::Context, screen_pos: egui::Pos2) {
-        let top_left = screen_pos - egui::vec2(RADIAL_OVERLAY_MARGIN, RADIAL_OVERLAY_MARGIN);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::MousePassthrough(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Transparent(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-            egui::viewport::WindowLevel::AlwaysOnTop,
-        ));
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            RADIAL_OVERLAY_SIZE,
-            RADIAL_OVERLAY_SIZE,
-        )));
-        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(top_left));
     }
 
     fn restore_panel_window(&mut self, ctx: &egui::Context) {
@@ -568,25 +481,18 @@ impl QuickerApp {
             );
         }
 
-        if menu.source == RadialMenuSource::GlobalTrigger {
-            self.restore_panel_window(ctx);
-        }
+        let _ = ctx;
     }
 
     fn cancel_radial_menu(&mut self, ctx: &egui::Context) {
-        let Some(menu) = self.radial_menu.take() else {
+        let Some(_menu) = self.radial_menu.take() else {
             return;
         };
-
-        if menu.source == RadialMenuSource::GlobalTrigger {
-            self.restore_panel_window(ctx);
-        }
+        let _ = ctx;
     }
 
     fn handle_radial_menu_input(&mut self, ctx: &egui::Context) {
-        if self.view != View::Panel
-            || self.radial_menu_source() == Some(RadialMenuSource::GlobalTrigger)
-        {
+        if self.view != View::Panel {
             return;
         }
 
@@ -616,10 +522,6 @@ impl QuickerApp {
         } else if self.radial_menu.is_some() && secondary_down {
             ctx.request_repaint();
         }
-    }
-
-    fn radial_menu_source(&self) -> Option<RadialMenuSource> {
-        self.radial_menu.as_ref().map(|menu| menu.source)
     }
 
     fn filtered_entries(&self, entries: &[ActionListEntry]) -> Vec<ActionListEntry> {
@@ -1359,41 +1261,6 @@ impl QuickerApp {
         }
     }
 
-    fn handle_global_mouse_events(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.global_mouse_hook.try_recv() {
-            match event {
-                GlobalMouseEvent::GestureStart {
-                    screen_pos,
-                    button,
-                    process,
-                } => {
-                    let gesture_process = process.clone().or_else(focus::detect_focused_process);
-                    if let Some(process) = gesture_process.as_ref() {
-                        self.focus_tracker.observe(Some(process.clone()));
-                        self.sync_profile_to_process(process);
-                    } else {
-                        self.set_active_profile(self.global_profile_idx());
-                    }
-
-                    tracing::debug!("global gesture start: {:?} for {:?}", button, process);
-                    self.start_global_radial_menu(ctx, egui::pos2(screen_pos.0, screen_pos.1));
-                }
-                GlobalMouseEvent::GestureMove { screen_pos } => {
-                    self.update_global_radial_menu(egui::pos2(screen_pos.0, screen_pos.1));
-                }
-                GlobalMouseEvent::GestureEnd { screen_pos } => {
-                    self.update_global_radial_menu(egui::pos2(screen_pos.0, screen_pos.1));
-                    self.complete_radial_menu(ctx);
-                }
-                GlobalMouseEvent::Unsupported { reason } => {
-                    if self.startup_notice.is_none() {
-                        self.startup_notice = Some((reason, true));
-                    }
-                }
-            }
-        }
-    }
-
     fn handle_global_hotkey(&mut self, ctx: &egui::Context) {
         let Some(toggle_hotkey) = self.toggle_hotkey else {
             return;
@@ -1423,7 +1290,6 @@ impl QuickerApp {
         let Some(menu) = &self.radial_menu else {
             return;
         };
-
         let painter = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Foreground,
             egui::Id::new("radial_menu"),
@@ -1478,7 +1344,6 @@ impl eframe::App for QuickerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.show_startup_notice_once();
         self.handle_global_hotkey(ctx);
-        self.handle_global_mouse_events(ctx);
 
         // Handle Escape key
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1500,8 +1365,7 @@ impl eframe::App for QuickerApp {
         }
         self.handle_radial_menu_input(ctx);
 
-        let is_global_overlay = self.radial_menu_source() == Some(RadialMenuSource::GlobalTrigger);
-        if !self.panel_hidden && !is_global_overlay {
+        if !self.panel_hidden {
             egui::CentralPanel::default().show(ctx, |ui| match self.view {
                 View::Panel => self.render_panel(ui),
                 View::Settings => self.render_settings(ui),

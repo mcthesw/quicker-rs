@@ -25,6 +25,7 @@ pub struct QuickerApp {
     search: SearchEngine,
     query: String,
     active_profile: usize,
+    group_path: Vec<usize>,
     view: View,
     toast: Option<Toast>,
     script_output: String,
@@ -35,8 +36,8 @@ pub struct QuickerApp {
     edit_icon: String,
     edit_tags: String,
     edit_kind_idx: usize,
-    edit_field1: String, // command / path / url / script / text
-    edit_field2: String, // args / shell
+    edit_field1: String, // command / path / url / script / text / template
+    edit_field2: String, // args / shell / fallback url
     edit_field3: String, // working_dir
 }
 
@@ -58,6 +59,7 @@ impl QuickerApp {
             search: SearchEngine::new(),
             query: String::new(),
             active_profile: 0,
+            group_path: Vec::new(),
             view: View::Panel,
             toast: None,
             script_output: String::new(),
@@ -99,12 +101,87 @@ impl QuickerApp {
         }
     }
 
-    fn current_actions(&self) -> &[Action] {
+    fn reset_editor(&mut self) {
+        self.edit_name.clear();
+        self.edit_desc.clear();
+        self.edit_icon.clear();
+        self.edit_tags.clear();
+        self.edit_kind_idx = 0;
+        self.edit_field1.clear();
+        self.edit_field2.clear();
+        self.edit_field3.clear();
+    }
+
+    fn current_profile_actions(&self) -> &[Action] {
         self.config
             .profiles
             .get(self.active_profile)
             .map(|p| p.actions.as_slice())
             .unwrap_or(&[])
+    }
+
+    fn actions_at_path<'a>(actions: &'a [Action], path: &[usize]) -> Option<&'a [Action]> {
+        let mut current = actions;
+        for &idx in path {
+            let action = current.get(idx)?;
+            match &action.kind {
+                ActionKind::Group { actions } => current = actions,
+                _ => return None,
+            }
+        }
+        Some(current)
+    }
+
+    fn actions_at_path_mut<'a>(
+        actions: &'a mut Vec<Action>,
+        path: &[usize],
+    ) -> Option<&'a mut Vec<Action>> {
+        if let Some((&idx, rest)) = path.split_first() {
+            let action = actions.get_mut(idx)?;
+            match &mut action.kind {
+                ActionKind::Group { actions } => Self::actions_at_path_mut(actions, rest),
+                _ => None,
+            }
+        } else {
+            Some(actions)
+        }
+    }
+
+    fn current_actions(&self) -> &[Action] {
+        Self::actions_at_path(self.current_profile_actions(), &self.group_path)
+            .unwrap_or_else(|| self.current_profile_actions())
+    }
+
+    fn current_actions_mut(&mut self) -> Option<&mut Vec<Action>> {
+        let path = self.group_path.clone();
+        let profile = self.config.profiles.get_mut(self.active_profile)?;
+        Self::actions_at_path_mut(&mut profile.actions, &path)
+    }
+
+    fn group_titles(&self) -> Vec<String> {
+        let mut titles = Vec::new();
+        let mut current = self.current_profile_actions();
+        for &idx in &self.group_path {
+            let Some(action) = current.get(idx) else {
+                break;
+            };
+            titles.push(action.name.clone());
+            match &action.kind {
+                ActionKind::Group { actions } => current = actions,
+                _ => break,
+            }
+        }
+        titles
+    }
+
+    fn open_group(&mut self, action_idx: usize) {
+        self.group_path.push(action_idx);
+        self.query.clear();
+    }
+
+    fn leave_group(&mut self) {
+        self.group_path.pop();
+        self.query.clear();
     }
 
     fn render_panel(&mut self, ui: &mut egui::Ui) {
@@ -114,6 +191,7 @@ impl QuickerApp {
                 let selected = i == self.active_profile;
                 if ui.selectable_label(selected, &profile.name).clicked() {
                     self.active_profile = i;
+                    self.group_path.clear();
                     self.query.clear();
                 }
             }
@@ -122,20 +200,27 @@ impl QuickerApp {
                     self.view = View::Settings;
                 }
                 if ui.button("＋").on_hover_text("Add action").clicked() {
-                    self.edit_name.clear();
-                    self.edit_desc.clear();
-                    self.edit_icon.clear();
-                    self.edit_tags.clear();
-                    self.edit_kind_idx = 0;
-                    self.edit_field1.clear();
-                    self.edit_field2.clear();
-                    self.edit_field3.clear();
+                    self.reset_editor();
                     self.view = View::ActionEditor;
                 }
             });
         });
 
         ui.separator();
+
+        if !self.group_path.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("← Back").clicked() {
+                    self.leave_group();
+                }
+                ui.label(egui::RichText::new("Root").weak());
+                for title in self.group_titles() {
+                    ui.label(egui::RichText::new("›").weak());
+                    ui.label(title);
+                }
+            });
+            ui.add_space(4.0);
+        }
 
         // --- Search bar ---
         let search_response = ui.add(
@@ -168,13 +253,13 @@ impl QuickerApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let mut clicked_action: Option<Action> = None;
+                let mut clicked_action: Option<(usize, Action)> = None;
                 egui::Grid::new("action_grid")
                     .num_columns(cols)
                     .spacing([8.0, 8.0])
                     .min_col_width(ui.available_width() / cols as f32 - 8.0)
                     .show(ui, |ui| {
-                        for (i, (_score, action)) in results.iter().enumerate() {
+                        for (i, (_score, action_idx, action)) in results.iter().enumerate() {
                             if i > 0 && i % cols == 0 {
                                 ui.end_row();
                             }
@@ -182,8 +267,15 @@ impl QuickerApp {
                                 .available_width()
                                 .min((self.config.panel_width - 32.0) / cols as f32 - 8.0);
 
-                            let icon = action.icon.as_deref().unwrap_or("▶");
-                            let label = format!("{} {}", icon, action.name);
+                            let default_icon = match &action.kind {
+                                ActionKind::Group { .. } => "📂",
+                                _ => "▶",
+                            };
+                            let icon = action.icon.as_deref().unwrap_or(default_icon);
+                            let label = match &action.kind {
+                                ActionKind::Group { .. } => format!("{} {} ›", icon, action.name),
+                                _ => format!("{} {}", icon, action.name),
+                            };
 
                             let btn = egui::Button::new(egui::RichText::new(&label).size(14.0))
                                 .min_size(egui::vec2(btn_width, 48.0));
@@ -195,18 +287,21 @@ impl QuickerApp {
                             }
 
                             if response.clicked() {
-                                clicked_action = Some((*action).clone());
+                                clicked_action = Some((*action_idx, (*action).clone()));
                             }
                         }
                         // If only one result and Enter pressed, run it
                         if results.len() == 1 && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            clicked_action = Some(results[0].1.clone());
+                            clicked_action = Some((results[0].1, results[0].2.clone()));
                         }
                     });
 
                 // Execute outside the borrow
-                if let Some(action) = clicked_action {
-                    self.execute_action(&action);
+                if let Some((action_idx, action)) = clicked_action {
+                    match action.kind {
+                        ActionKind::Group { .. } => self.open_group(action_idx),
+                        _ => self.execute_action(&action),
+                    }
                 }
             });
     }
@@ -324,6 +419,10 @@ impl QuickerApp {
                 "Run Shell Script",
                 "Copy Text",
                 "Open Folder",
+                "Group",
+                "Search Clipboard Text",
+                "Open Clipboard Text",
+                "Run Clipboard Text",
             ];
             egui::ComboBox::from_id_salt("action_kind")
                 .selected_text(kinds[self.edit_kind_idx])
@@ -375,6 +474,24 @@ impl QuickerApp {
                     ui.label("Folder path:");
                     ui.text_edit_singleline(&mut self.edit_field1);
                 }
+                6 => {
+                    ui.label("Creates an empty group. Open it from the panel and add child actions inside it.");
+                }
+                7 => {
+                    ui.label("Search URL template:");
+                    ui.text_edit_singleline(&mut self.edit_field1);
+                    ui.label("Use {query} where clipboard text should be inserted.");
+                }
+                8 => {
+                    ui.label("Fallback search URL template (optional):");
+                    ui.text_edit_singleline(&mut self.edit_field2);
+                    ui.label("If clipboard is not a URL/path, use {query} in this template to search it.");
+                }
+                9 => {
+                    ui.label("Shell (sh, bash, powershell, cmd):");
+                    ui.text_edit_singleline(&mut self.edit_field2);
+                    ui.label("Runs the current clipboard text as a command.");
+                }
                 _ => {}
             }
 
@@ -415,6 +532,28 @@ impl QuickerApp {
                     5 => ActionKind::OpenFolder {
                         path: self.edit_field1.clone(),
                     },
+                    6 => ActionKind::Group { actions: vec![] },
+                    7 => ActionKind::SearchClipboardText {
+                        url_template: if self.edit_field1.is_empty() {
+                            "https://www.google.com/search?q={query}".into()
+                        } else {
+                            self.edit_field1.clone()
+                        },
+                    },
+                    8 => ActionKind::OpenClipboardText {
+                        fallback_search_url: if self.edit_field2.is_empty() {
+                            Some("https://www.google.com/search?q={query}".into())
+                        } else {
+                            Some(self.edit_field2.clone())
+                        },
+                    },
+                    9 => ActionKind::RunClipboardText {
+                        shell: if self.edit_field2.is_empty() {
+                            "sh".into()
+                        } else {
+                            self.edit_field2.clone()
+                        },
+                    },
                     _ => unreachable!(),
                 };
 
@@ -436,8 +575,8 @@ impl QuickerApp {
                     kind,
                 };
 
-                if let Some(profile) = self.config.profiles.get_mut(self.active_profile) {
-                    profile.actions.push(action);
+                if let Some(actions) = self.current_actions_mut() {
+                    actions.push(action);
                 }
                 self.config.save();
                 self.show_toast("Action added!".into(), false);
@@ -506,6 +645,8 @@ impl eframe::App for QuickerApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.view != View::Panel {
                 self.view = View::Panel;
+            } else if !self.group_path.is_empty() {
+                self.leave_group();
             }
         }
 

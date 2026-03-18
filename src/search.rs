@@ -15,22 +15,27 @@ impl SearchEngine {
 
     /// Return actions sorted by match score (best first).
     /// Returns all actions if query is empty.
-    pub fn search<'a>(&self, query: &str, actions: &'a [Action]) -> Vec<(i64, &'a Action)> {
+    pub fn search<'a>(&self, query: &str, actions: &'a [Action]) -> Vec<(i64, usize, &'a Action)> {
         if query.trim().is_empty() {
-            return actions.iter().map(|a| (0, a)).collect();
+            return actions
+                .iter()
+                .enumerate()
+                .map(|(idx, action)| (0, idx, action))
+                .collect();
         }
 
-        let mut results: Vec<(i64, &Action)> = actions
+        let mut results: Vec<(i64, usize, &Action)> = actions
             .iter()
-            .filter_map(|action| {
+            .enumerate()
+            .filter_map(|(idx, action)| {
                 let text = action.search_text();
                 self.matcher
                     .fuzzy_match(&text, query)
-                    .map(|score| (score, action))
+                    .map(|score| (score, idx, action))
             })
             .collect();
 
-        results.sort_by(|a, b| b.0.cmp(&a.0));
+        results.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         results
     }
 }

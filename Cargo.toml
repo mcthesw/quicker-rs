@@ -43,6 +43,9 @@ which = "7"
 # Clipboard
 arboard = "3"
 
+# URL encoding for search actions
+urlencoding = "2"
+
 [profile.release]
 opt-level = "z"     # Optimize for size
 lto = true          # Link-time optimization

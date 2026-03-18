@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use std::process::Command;
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+))]
+use arboard::{GetExtLinux, LinuxClipboardKind};
 
 /// Represents what happens when an action is triggered.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +35,21 @@ pub enum ActionKind {
     CopyText { text: String },
     /// Open a directory in the file manager
     OpenFolder { path: String },
+    /// Search using text currently in the clipboard
+    SearchClipboardText {
+        #[serde(default = "default_search_url")]
+        url_template: String,
+    },
+    /// Open a URL or file path from clipboard text, with optional fallback search
+    OpenClipboardText {
+        #[serde(default)]
+        fallback_search_url: Option<String>,
+    },
+    /// Run the clipboard text as a shell command
+    RunClipboardText {
+        #[serde(default = "default_shell")]
+        shell: String,
+    },
     /// A group/folder that contains sub-actions
     Group { actions: Vec<Action> },
 }
@@ -38,6 +60,10 @@ fn default_shell() -> String {
     } else {
         "sh".into()
     }
+}
+
+fn default_search_url() -> String {
+    "https://www.google.com/search?q={query}".into()
 }
 
 /// A single action in the launcher panel.
@@ -95,36 +121,7 @@ impl Action {
                 Err(e) => ExecResult::Err(format!("Failed to open URL '{}': {}", url, e)),
             },
 
-            ActionKind::RunShell { script, shell } => {
-                let (sh, flag) = if cfg!(target_os = "windows") {
-                    match shell.as_str() {
-                        "cmd" => ("cmd", "/C"),
-                        _ => ("powershell", "-Command"),
-                    }
-                } else {
-                    (shell.as_str(), "-c")
-                };
-
-                match Command::new(sh).arg(flag).arg(script).output() {
-                    Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                        if output.status.success() {
-                            if stdout.trim().is_empty() {
-                                ExecResult::Ok
-                            } else {
-                                ExecResult::OkWithMessage(stdout)
-                            }
-                        } else {
-                            ExecResult::Err(format!(
-                                "Script exited with {}\n{}{}",
-                                output.status, stdout, stderr
-                            ))
-                        }
-                    }
-                    Err(e) => ExecResult::Err(format!("Failed to run shell: {}", e)),
-                }
-            }
+            ActionKind::RunShell { script, shell } => run_shell_command(script, shell),
 
             ActionKind::CopyText { text } => match arboard::Clipboard::new() {
                 Ok(mut cb) => match cb.set_text(text) {
@@ -133,6 +130,70 @@ impl Action {
                 },
                 Err(e) => ExecResult::Err(format!("Clipboard error: {}", e)),
             },
+
+            ActionKind::SearchClipboardText { url_template } => {
+                let clipboard_text = match read_clipboard_text() {
+                    Ok(text) => text,
+                    Err(err) => return ExecResult::Err(err),
+                };
+                let encoded = urlencoding::encode(&clipboard_text);
+                let url = if url_template.contains("{query}") {
+                    url_template.replace("{query}", encoded.as_ref())
+                } else {
+                    format!("{url_template}{encoded}")
+                };
+                match open::that(&url) {
+                    Ok(_) => ExecResult::OkWithMessage(format!("Searched for: {}", clipboard_text)),
+                    Err(e) => {
+                        ExecResult::Err(format!("Failed to open search URL '{}': {}", url, e))
+                    }
+                }
+            }
+
+            ActionKind::OpenClipboardText {
+                fallback_search_url,
+            } => {
+                let clipboard_text = match read_clipboard_text() {
+                    Ok(text) => text,
+                    Err(err) => return ExecResult::Err(err),
+                };
+
+                if let Some(target) = clipboard_target(&clipboard_text) {
+                    match open::that(&target) {
+                        Ok(_) => ExecResult::OkWithMessage(format!("Opened: {}", clipboard_text)),
+                        Err(e) => ExecResult::Err(format!("Failed to open '{}': {}", target, e)),
+                    }
+                } else if let Some(url_template) = fallback_search_url {
+                    let encoded = urlencoding::encode(&clipboard_text);
+                    let url = if url_template.contains("{query}") {
+                        url_template.replace("{query}", encoded.as_ref())
+                    } else {
+                        format!("{url_template}{encoded}")
+                    };
+                    match open::that(&url) {
+                        Ok(_) => {
+                            ExecResult::OkWithMessage(format!("Searched for: {}", clipboard_text))
+                        }
+                        Err(e) => ExecResult::Err(format!(
+                            "Failed to open fallback search '{}': {}",
+                            url, e
+                        )),
+                    }
+                } else {
+                    ExecResult::Err(
+                        "Clipboard does not contain a URL or existing path, and no fallback search URL is configured"
+                            .into(),
+                    )
+                }
+            }
+
+            ActionKind::RunClipboardText { shell } => {
+                let clipboard_text = match read_clipboard_text() {
+                    Ok(text) => text,
+                    Err(err) => return ExecResult::Err(err),
+                };
+                run_shell_command(&clipboard_text, shell)
+            }
 
             ActionKind::Group { .. } => {
                 // Groups are navigated in the UI, not "executed"
@@ -145,6 +206,97 @@ impl Action {
     pub fn search_text(&self) -> String {
         let mut parts = vec![self.name.clone(), self.description.clone()];
         parts.extend(self.tags.clone());
+        if let ActionKind::Group { actions } = &self.kind {
+            parts.extend(actions.iter().map(Action::search_text));
+        }
         parts.join(" ")
+    }
+}
+
+fn read_clipboard_text() -> Result<String, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| format!("Clipboard error: {}", e))?;
+
+    if let Some(text) = normalize_clipboard_text(clipboard.get_text().ok()) {
+        return Ok(text);
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
+    ))]
+    {
+        if let Some(text) = normalize_clipboard_text(
+            clipboard
+                .get()
+                .clipboard(LinuxClipboardKind::Primary)
+                .text()
+                .ok(),
+        ) {
+            return Ok(text);
+        }
+    }
+
+    Err(
+        "No usable text was found in the clipboard. On Linux, select text first or copy it explicitly."
+            .into(),
+    )
+}
+
+fn normalize_clipboard_text(text: Option<String>) -> Option<String> {
+    let trimmed = text?.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn clipboard_target(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(trimmed.into());
+    }
+    if Path::new(trimmed).exists() {
+        return Some(trimmed.into());
+    }
+    if !trimmed.contains(char::is_whitespace) && trimmed.contains('.') {
+        return Some(format!("https://{}", trimmed));
+    }
+    None
+}
+
+fn run_shell_command(script: &str, shell: &str) -> ExecResult {
+    let (sh, flag) = if cfg!(target_os = "windows") {
+        match shell {
+            "cmd" => ("cmd", "/C"),
+            _ => ("powershell", "-Command"),
+        }
+    } else {
+        (shell, "-c")
+    };
+
+    match Command::new(sh).arg(flag).arg(script).output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if output.status.success() {
+                let message = match (stdout.trim(), stderr.trim()) {
+                    ("", "") => None,
+                    ("", stderr) => Some(stderr.to_string()),
+                    (stdout, "") => Some(stdout.to_string()),
+                    (stdout, stderr) => Some(format!("{}\n{}", stdout, stderr)),
+                };
+                match message {
+                    Some(message) => ExecResult::OkWithMessage(message),
+                    None => ExecResult::Ok,
+                }
+            } else {
+                ExecResult::Err(format!(
+                    "Script exited with {}\n{}{}",
+                    output.status, stdout, stderr
+                ))
+            }
+        }
+        Err(e) => ExecResult::Err(format!("Failed to run shell '{}': {}", shell, e)),
     }
 }

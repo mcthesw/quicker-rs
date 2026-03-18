@@ -68,6 +68,10 @@ impl Config {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match toml::from_str(&content) {
                     Ok(cfg) => {
+                        let (cfg, changed) = Self::migrate_loaded(cfg);
+                        if changed {
+                            cfg.save();
+                        }
                         tracing::info!("Loaded config from {}", path.display());
                         return cfg;
                     }
@@ -83,6 +87,35 @@ impl Config {
         let cfg = Self::default();
         cfg.save();
         cfg
+    }
+
+    fn migrate_loaded(mut cfg: Self) -> (Self, bool) {
+        let mut changed = false;
+
+        if cfg.profiles.is_empty() {
+            return (Self::default(), true);
+        }
+
+        for profile in &mut cfg.profiles {
+            if is_legacy_default_profile(profile) {
+                profile.actions = example_actions();
+                changed = true;
+                continue;
+            }
+
+            for action in pdf_demo_actions() {
+                if !profile
+                    .actions
+                    .iter()
+                    .any(|existing| existing.name == action.name)
+                {
+                    profile.actions.push(action);
+                    changed = true;
+                }
+            }
+        }
+
+        (cfg, changed)
     }
 
     /// Save config to disk.
@@ -120,10 +153,7 @@ impl Default for Config {
 
 /// Starter actions so the panel isn't empty on first launch.
 fn example_actions() -> Vec<Action> {
-    let mut actions = vec![];
-
-    // Cross-platform examples
-    actions.push(Action {
+    let terminal = Action {
         name: "Terminal".into(),
         description: "Open a terminal emulator".into(),
         icon: Some("🖥".into()),
@@ -147,9 +177,9 @@ fn example_actions() -> Vec<Action> {
             args: vec![],
             working_dir: None,
         },
-    });
+    };
 
-    actions.push(Action {
+    let file_manager = Action {
         name: "File Manager".into(),
         description: "Open home directory".into(),
         icon: Some("📁".into()),
@@ -161,9 +191,9 @@ fn example_actions() -> Vec<Action> {
                 .to_string_lossy()
                 .to_string(),
         },
-    });
+    };
 
-    actions.push(Action {
+    let web_browser = Action {
         name: "Web Browser".into(),
         description: "Open default browser".into(),
         icon: Some("🌐".into()),
@@ -172,9 +202,9 @@ fn example_actions() -> Vec<Action> {
         kind: ActionKind::OpenUrl {
             url: "https://google.com".into(),
         },
-    });
+    };
 
-    actions.push(Action {
+    let system_info = Action {
         name: "System Info".into(),
         description: "Show basic system information".into(),
         icon: Some("ℹ️".into()),
@@ -188,9 +218,9 @@ fn example_actions() -> Vec<Action> {
             },
             shell: default_shell(),
         },
-    });
+    };
 
-    actions.push(Action {
+    let ip_address = Action {
         name: "IP Address".into(),
         description: "Show network IP addresses".into(),
         icon: Some("📡".into()),
@@ -204,9 +234,9 @@ fn example_actions() -> Vec<Action> {
             },
             shell: default_shell(),
         },
-    });
+    };
 
-    actions.push(Action {
+    let clipboard = Action {
         name: "Clipboard History".into(),
         description: "Copy a useful snippet".into(),
         icon: Some("📋".into()),
@@ -215,9 +245,83 @@ fn example_actions() -> Vec<Action> {
         kind: ActionKind::CopyText {
             text: "Hello from Quicker-RS!".into(),
         },
-    });
+    };
 
-    actions
+    let mut pdf_demo = pdf_demo_actions().into_iter();
+    let quick_search = pdf_demo.next().unwrap();
+    let smart_open_clipboard = pdf_demo.next().unwrap();
+    let run_clipboard_text = pdf_demo.next().unwrap();
+
+    let mut desktop_tools = vec![terminal.clone(), file_manager.clone()];
+    if let Some(editor) = default_text_editor_action() {
+        desktop_tools.push(editor);
+    }
+    if let Some(calculator) = default_calculator_action() {
+        desktop_tools.push(calculator);
+    }
+
+    let web_shortcuts = vec![
+        web_browser.clone(),
+        Action {
+            name: "GitHub".into(),
+            description: "Open GitHub".into(),
+            icon: Some("🐙".into()),
+            tags: vec!["git".into(), "code".into(), "repo".into()],
+            hotkey: None,
+            kind: ActionKind::OpenUrl {
+                url: "https://github.com".into(),
+            },
+        },
+        Action {
+            name: "Rust Docs".into(),
+            description: "Open the Rust standard library docs".into(),
+            icon: Some("🦀".into()),
+            tags: vec!["rust".into(), "docs".into(), "std".into()],
+            hotkey: None,
+            kind: ActionKind::OpenUrl {
+                url: "https://doc.rust-lang.org/std/".into(),
+            },
+        },
+        Action {
+            name: "Crates.io".into(),
+            description: "Browse Rust crates".into(),
+            icon: Some("📦".into()),
+            tags: vec!["rust".into(), "crate".into(), "packages".into()],
+            hotkey: None,
+            kind: ActionKind::OpenUrl {
+                url: "https://crates.io".into(),
+            },
+        },
+    ];
+
+    vec![
+        Action {
+            name: "Desktop Tools".into(),
+            description: "Grouped desktop utilities".into(),
+            icon: Some("🧰".into()),
+            tags: vec!["tools".into(), "group".into(), "desktop".into()],
+            hotkey: None,
+            kind: ActionKind::Group {
+                actions: desktop_tools,
+            },
+        },
+        Action {
+            name: "Web Shortcuts".into(),
+            description: "Grouped browser and web shortcuts".into(),
+            icon: Some("🌍".into()),
+            tags: vec!["web".into(), "browser".into(), "group".into()],
+            hotkey: None,
+            kind: ActionKind::Group {
+                actions: web_shortcuts,
+            },
+        },
+        quick_search,
+        smart_open_clipboard,
+        run_clipboard_text,
+        system_info,
+        ip_address,
+        clipboard,
+    ]
 }
 
 fn default_shell() -> String {
@@ -226,4 +330,124 @@ fn default_shell() -> String {
     } else {
         "sh".into()
     }
+}
+
+fn detect_command(candidates: &[&str]) -> Option<String> {
+    candidates.iter().find_map(|command| {
+        which::which(command)
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+    })
+}
+
+fn default_text_editor_action() -> Option<Action> {
+    let command = if cfg!(target_os = "windows") {
+        Some("notepad".into())
+    } else if cfg!(target_os = "macos") {
+        Some("/Applications/TextEdit.app/Contents/MacOS/TextEdit".into())
+    } else {
+        detect_command(&[
+            "gedit", "xed", "kate", "mousepad", "pluma", "leafpad", "code",
+        ])
+    }?;
+
+    Some(Action {
+        name: "Notepad".into(),
+        description: "Open a text editor".into(),
+        icon: Some("📝".into()),
+        tags: vec!["notes".into(), "editor".into(), "text".into()],
+        hotkey: None,
+        kind: ActionKind::RunProgram {
+            command,
+            args: vec![],
+            working_dir: None,
+        },
+    })
+}
+
+fn default_calculator_action() -> Option<Action> {
+    let command = if cfg!(target_os = "windows") {
+        Some("calc".into())
+    } else if cfg!(target_os = "macos") {
+        Some("/System/Applications/Calculator.app/Contents/MacOS/Calculator".into())
+    } else {
+        detect_command(&["gnome-calculator", "kcalc", "galculator", "qalculate-gtk"])
+    }?;
+
+    Some(Action {
+        name: "Calculator".into(),
+        description: "Open the system calculator".into(),
+        icon: Some("🧮".into()),
+        tags: vec!["calc".into(), "math".into(), "desktop".into()],
+        hotkey: None,
+        kind: ActionKind::RunProgram {
+            command,
+            args: vec![],
+            working_dir: None,
+        },
+    })
+}
+
+fn pdf_demo_actions() -> Vec<Action> {
+    vec![
+        Action {
+            name: "Quick Search".into(),
+            description: "Search the current clipboard text in your browser".into(),
+            icon: Some("🔎".into()),
+            tags: vec!["search".into(), "clipboard".into(), "selected text".into()],
+            hotkey: None,
+            kind: ActionKind::SearchClipboardText {
+                url_template: "https://www.google.com/search?q={query}".into(),
+            },
+        },
+        Action {
+            name: "Smart Open Clipboard".into(),
+            description: "Open the clipboard as a URL/path, or search for it if needed".into(),
+            icon: Some("🧠".into()),
+            tags: vec![
+                "clipboard".into(),
+                "url".into(),
+                "link".into(),
+                "smart".into(),
+            ],
+            hotkey: None,
+            kind: ActionKind::OpenClipboardText {
+                fallback_search_url: Some("https://www.google.com/search?q={query}".into()),
+            },
+        },
+        Action {
+            name: "Run Clipboard Text".into(),
+            description: "Run the current clipboard text as a shell command".into(),
+            icon: Some("▶".into()),
+            tags: vec![
+                "clipboard".into(),
+                "run".into(),
+                "command".into(),
+                "selected text".into(),
+            ],
+            hotkey: None,
+            kind: ActionKind::RunClipboardText {
+                shell: default_shell(),
+            },
+        },
+    ]
+}
+
+fn is_legacy_default_profile(profile: &Profile) -> bool {
+    const LEGACY_DEFAULT_ACTIONS: [&str; 6] = [
+        "Terminal",
+        "File Manager",
+        "Web Browser",
+        "System Info",
+        "IP Address",
+        "Clipboard History",
+    ];
+
+    profile.name == "Default"
+        && profile.actions.len() == LEGACY_DEFAULT_ACTIONS.len()
+        && profile
+            .actions
+            .iter()
+            .map(|action| action.name.as_str())
+            .eq(LEGACY_DEFAULT_ACTIONS)
 }

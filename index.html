@@ -7,23 +7,28 @@
       content="width=device-width, initial-scale=1, viewport-fit=cover"
     />
     <title>Quicker-RS Preview</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+      }
+
+      body {
+        background: #111;
+      }
+
+      #quicker-canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+      }
+    </style>
   </head>
   <body>
-    <main class="shell">
-      <section class="banner">
-        <div>
-          <div class="title">Quicker-RS Web Preview</div>
-          <div class="subtitle">
-            Browser-safe wasm build for UI previewing on GitHub Pages.
-          </div>
-        </div>
-        <div class="note">
-          Native hotkeys, shell commands, and focused-window hooks stay in the
-          desktop binary.
-        </div>
-      </section>
-      <canvas id="quicker-canvas"></canvas>
-    </main>
+    <canvas id="quicker-canvas"></canvas>
     <script type="module">
       import init from "./app/quicker_rs.js";
 

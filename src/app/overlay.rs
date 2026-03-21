@@ -3,7 +3,7 @@ use super::*;
 impl QuickerApp {
     pub(super) fn render_toast(&mut self, ctx: &egui::Context) {
         if let Some(toast) = &self.toast {
-            if std::time::Instant::now() > toast.expires {
+            if Instant::now() > toast.expires {
                 self.toast = None;
                 return;
             }
@@ -70,6 +70,7 @@ impl QuickerApp {
         ctx.request_repaint();
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn handle_global_hotkey(&mut self, ctx: &egui::Context) {
         let Some(toggle_hotkey) = self.toggle_hotkey else {
             return;
@@ -88,6 +89,9 @@ impl QuickerApp {
             }
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(super) fn handle_global_hotkey(&mut self, _ctx: &egui::Context) {}
 
     pub(super) fn show_startup_notice_once(&mut self) {
         if let Some((message, is_error)) = self.startup_notice.take() {

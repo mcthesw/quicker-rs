@@ -1,0 +1,75 @@
+name: wasm-preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - web-preview
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: wasm-preview
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/configure-pages@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm-preview
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Resolve wasm-bindgen version
+        run: |
+          VERSION=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n '2s/version = "\(.*\)"/\1/p')
+          echo "WASM_BINDGEN_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Install wasm-bindgen-cli
+        run: |
+          TOOLS_ROOT="$RUNNER_TEMP/wasm-bindgen-cli"
+          cargo binstall wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --no-confirm --root "$TOOLS_ROOT"
+          echo "WASM_BINDGEN_BIN=$TOOLS_ROOT/bin/wasm-bindgen" >> "$GITHUB_ENV"
+
+      - name: Build wasm site
+        run: |
+          cargo build --release --target wasm32-unknown-unknown --lib
+          rm -rf dist
+          mkdir -p dist
+          cp index.html dist/index.html
+          "$WASM_BINDGEN_BIN" \
+            --target web \
+            --no-typescript \
+            --out-dir dist/app \
+            target/wasm32-unknown-unknown/release/quicker_rs.wasm
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

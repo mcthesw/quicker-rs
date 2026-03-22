@@ -17,10 +17,7 @@ use std::thread;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
-#[cfg(all(
-    unix,
-    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
-))]
+#[cfg(target_os = "linux")]
 use arboard::{GetExtLinux, LinuxClipboardKind};
 #[cfg(test)]
 use std::cell::RefCell;
@@ -3065,10 +3062,7 @@ fn read_clipboard_text() -> Result<String, String> {
         return Ok(text);
     }
 
-    #[cfg(all(
-        unix,
-        not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
-    ))]
+    #[cfg(target_os = "linux")]
     {
         if let Some(text) = read_primary_clipboard_text(&mut clipboard) {
             return Ok(text);
@@ -3096,11 +3090,7 @@ fn read_standard_clipboard_text(clipboard: &mut arboard::Clipboard) -> Option<St
     normalize_clipboard_text(clipboard.get_text().ok())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(all(
-    unix,
-    not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))
-))]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]
 fn read_primary_clipboard_text(clipboard: &mut arboard::Clipboard) -> Option<String> {
     #[cfg(test)]
     if let Some(text) = test_read_primary_clipboard_text() {
@@ -3953,7 +3943,7 @@ fn run_shell_command(
     ExecResult::Err("Shell execution is unavailable in the web preview".into())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]
 fn send_key_combo(modifiers: &[String], key: &str) -> Result<(), String> {
     #[cfg(test)]
     if let Some(result) = test_send_key_combo(modifiers, key) {
@@ -3983,12 +3973,23 @@ fn send_key_combo(modifiers: &[String], key: &str) -> Result<(), String> {
         })
 }
 
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "linux")))]
+fn send_key_combo(modifiers: &[String], key: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = test_send_key_combo(modifiers, key) {
+        return result;
+    }
+
+    let _ = (modifiers, key);
+    Err("Quicker key automation is currently only implemented on Linux".into())
+}
+
 #[cfg(target_arch = "wasm32")]
 fn send_key_combo(_modifiers: &[String], _key: &str) -> Result<(), String> {
     Err("Key automation is unavailable in the web preview".into())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), target_os = "linux"))]
 fn type_input_text(text: &str) -> Result<(), String> {
     #[cfg(test)]
     if let Some(result) = test_type_input_text(text) {
@@ -4013,6 +4014,17 @@ fn type_input_text(text: &str) -> Result<(), String> {
                 Err(format!("xdotool exited with {status}"))
             }
         })
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "linux")))]
+fn type_input_text(text: &str) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(result) = test_type_input_text(text) {
+        return result;
+    }
+
+    let _ = text;
+    Err("Quicker text automation is currently only implemented on Linux".into())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4209,7 +4221,7 @@ fn test_read_standard_clipboard_text() -> Option<Option<String>> {
     with_action_test_runtime(|runtime| runtime.standard_clipboard_reads.pop_front())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn test_read_primary_clipboard_text() -> Option<Option<String>> {
     with_action_test_runtime(|runtime| runtime.primary_clipboard_reads.pop_front())
 }
@@ -5103,12 +5115,23 @@ mod tests {
 
         let result = action(ActionKind::RunClipboardText { shell: "sh".into() }).execute();
 
-        assert_eq!(result, ExecResult::OkWithMessage("selected".into()));
         with_action_test_runtime(|runtime| {
-            assert_eq!(
-                runtime.shell_calls,
-                vec![("sh".into(), "echo selected".into())]
-            );
+            if cfg!(target_os = "linux") {
+                assert_eq!(result, ExecResult::OkWithMessage("selected".into()));
+                assert_eq!(
+                    runtime.shell_calls,
+                    vec![("sh".into(), "echo selected".into())]
+                );
+            } else {
+                assert_eq!(
+                    result,
+                    ExecResult::Err(
+                        "No usable text was found in the clipboard. On Linux, select text first or copy it explicitly."
+                            .into()
+                    )
+                );
+                assert!(runtime.shell_calls.is_empty());
+            }
         });
     }
 
